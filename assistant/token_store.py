@@ -35,6 +35,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import winshell
+
 APP_DIR_NAME = "TelegramPCAssistant"
 TOKEN_FILE_NAME = "token.json"
 TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_\-]{20,}$")
@@ -124,6 +126,39 @@ def _on_windows() -> bool:
     return os.name == "nt"
 
 
+_last_powershell_error = ""
+
+
+def last_powershell_error() -> str:
+    """Sanitized reason for the most recent failed PowerShell call here ("" if none). Never has the token."""
+    return _last_powershell_error
+
+
+def _powershell(argv_tail: list[str], *, extra_env: dict[str, str] | None = None,
+                timeout: float = 60) -> str | None:
+    """Run Windows PowerShell with the child environment; return stdout, or None on failure.
+
+    The full Windows PowerShell path is used, and PSModulePath from a PowerShell 7 parent
+    is removed (see :mod:`assistant.winshell`). A failure sets the sanitized reason.
+    """
+    global _last_powershell_error
+    env = winshell.child_env()
+    if extra_env:
+        env.update(extra_env)
+    argv = [winshell.windows_powershell_path(), "-NoProfile", "-NonInteractive", *argv_tail]
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout, check=False, env=env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _last_powershell_error = winshell.sanitize_failure(f"could not start PowerShell ({type(exc).__name__})")
+        return None
+    if proc.returncode != 0:
+        _last_powershell_error = winshell.sanitize_failure(
+            winshell.decode_output(getattr(proc, "stderr", b"")) or f"exit code {proc.returncode}")
+        return None
+    _last_powershell_error = ""
+    return winshell.decode_output(proc.stdout)
+
+
 def _current_user_sid() -> str | None:
     """SID of the signed-in Windows user, or None.
 
@@ -131,17 +166,14 @@ def _current_user_sid() -> str | None:
     can contain spaces, Arabic or other non-ASCII letters, and characters that
     permission syntax would misread. SIDs are the same in every display language.
     """
-    try:
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=20, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    out = _powershell(
+        ["-Command", "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"],
+        timeout=20,
+    )
+    if out is None:
         return None
-    value = (proc.stdout or "").strip()
-    return value if proc.returncode == 0 and _SID_RE.fullmatch(value) else None
+    value = out.strip()
+    return value if _SID_RE.fullmatch(value) else None
 
 
 # The access list is set and read back by one PowerShell script. Paths and SIDs
@@ -217,20 +249,12 @@ def acl_is_owner_only(report: dict | None, sid: str) -> bool:
 
 
 def _run_acl_script(script: str, target: Path, sid: str, *, directory: bool) -> dict | None:
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    env = dict(os.environ, TPA_ACL_PATH=str(target), TPA_ACL_SID=sid,
-               TPA_ACL_DIR="1" if directory else "0")
-    try:
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=60, check=False, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
+    extra = {"TPA_ACL_PATH": str(target), "TPA_ACL_SID": sid,
+             "TPA_ACL_DIR": "1" if directory else "0"}
+    out = _powershell(["-EncodedCommand", winshell.encode_script(script)], extra_env=extra, timeout=60)
+    if out is None:
         return None
-    if proc.returncode != 0:
-        return None
-    return _last_json_object(proc.stdout)
+    return _last_json_object(out)
 
 
 def windows_acl_report(target: Path) -> dict | None:
@@ -373,9 +397,11 @@ def save_token(token: str, path: Path | None = None) -> Path:
             target.unlink()
         except OSError:
             pass
+        reason = last_powershell_error()
         raise RuntimeError("Could not restrict the token file to your Windows account, "
                            "so the token was not saved. Run the command again from an "
-                           "account that can change file permissions.")
+                           "account that can change file permissions."
+                           + (f" PowerShell said: {reason}" if reason else ""))
     return target
 
 

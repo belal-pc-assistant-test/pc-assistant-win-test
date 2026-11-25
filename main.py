@@ -26,7 +26,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from assistant import audit, elevation, token_store                # noqa: E402
+from assistant import audit, elevation, token_store, winshell  # noqa: E402
 from assistant.config import Config, ConfigError, load_config      # noqa: E402
 from assistant.action_spec import VALID_ACTIONS                      # noqa: E402
 from assistant.planner import (                                    # noqa: E402
@@ -312,8 +312,14 @@ def self_check(config: Config) -> int:
 
     # 5) PowerShell
     print("\n[5] PowerShell")
-    exe = shutil.which("powershell") or shutil.which("pwsh")
-    if exe:
+    if os.name == "nt":
+        # The same executable the bot starts (full path under %SystemRoot%).
+        exe = winshell.windows_powershell_path()
+        found = os.path.isfile(exe) or shutil.which(exe) is not None
+    else:
+        exe = shutil.which("pwsh") or ""
+        found = bool(exe)
+    if found:
         _ok("powershell found", exe)
     else:
         (_fail if os.name == "nt" else _warn)("powershell not found", "PowerShell actions will fail")

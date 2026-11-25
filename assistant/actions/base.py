@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol, runtime_checkable
 
 from .. import token_store
+from .. import winshell
 from ..config import Config, normalize_path, path_is_inside
 
 IS_WINDOWS = os.name == "nt"
@@ -363,15 +364,19 @@ def run_process(
 
 
 def powershell_exe() -> list[str]:
-    """Executable + flags to run a PowerShell command."""
+    """Executable + flags to run a PowerShell command.
+
+    On Windows this is Windows PowerShell 5 by its full path (see assistant.winshell);
+    ``pwsh`` is used only when Windows PowerShell is missing altogether.
+    """
     if IS_WINDOWS:
-        for candidate in ("powershell", "pwsh"):
-            exe = shutil.which(candidate)
-            if exe:
-                return [
-                    exe, "-NoProfile", "-NonInteractive", "-Command",
-                ]
-        raise ActionError("PowerShell was not found on this system.")
+        exe = winshell.windows_powershell_path()
+        if exe == "powershell" and shutil.which("powershell") is None:
+            pwsh = shutil.which("pwsh")
+            if pwsh:
+                return [pwsh, "-NoProfile", "-NonInteractive", "-Command"]
+            raise ActionError("PowerShell was not found on this system.")
+        return [exe, "-NoProfile", "-NonInteractive", "-Command"]
     pwsh = shutil.which("pwsh")
     if pwsh:
         return [pwsh, "-NoProfile", "-NonInteractive", "-Command"]
@@ -386,7 +391,8 @@ def run_powershell(command: str, timeout: float, cwd: Path | None = None) -> sub
         "try { chcp 65001 > $null } catch {}; "
         f"{command}"
     )
-    return run_process(powershell_exe() + [wrapped], timeout, cwd)
+    env = winshell.child_env() if IS_WINDOWS else None  # no PowerShell 7 module path in the child
+    return run_process(powershell_exe() + [wrapped], timeout, cwd, env=env)
 
 
 def windows_only(feature: str) -> ActionError:

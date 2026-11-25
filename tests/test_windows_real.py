@@ -159,6 +159,12 @@ class IcaclsParserTests(unittest.TestCase):
 # Token store on a real file
 # ---------------------------------------------------------------------------
 
+def _why() -> str:
+    """The sanitized reason from the last PowerShell call (Round 9), for failure messages."""
+    reason = token_store.last_powershell_error()
+    return f" [PowerShell reason: {reason}]" if reason else " [no PowerShell reason recorded]"
+
+
 @ONLY_WINDOWS
 class TokenStoreWindowsTests(unittest.TestCase):
 
@@ -168,7 +174,7 @@ class TokenStoreWindowsTests(unittest.TestCase):
 
     def test_current_user_sid_is_a_valid_sid_for_this_user(self):
         sid = token_store._current_user_sid()
-        self.assertIsNotNone(sid, "PowerShell did not return a SID")
+        self.assertIsNotNone(sid, "PowerShell did not return a SID." + _why())
         self.assertRegex(sid, r"^S-1-\d+(-\d+)+$")
         _account, whoami_sid = current_identity()
         self.assertEqual(sid, whoami_sid)
@@ -177,7 +183,7 @@ class TokenStoreWindowsTests(unittest.TestCase):
         target = self.root / "token.json"
         target.write_text("{}", encoding="utf-8")
         method = token_store._lock_down(target)
-        self.assertEqual(method, "acl")
+        self.assertEqual(method, "acl", f"lock-down used {method!r}." + _why())
         account, sid = current_identity()
         # Independent check: icacls lists exactly the current user, and no SYSTEM,
         # Administrators or OWNER RIGHTS entry is left behind.
@@ -189,7 +195,11 @@ class TokenStoreWindowsTests(unittest.TestCase):
 
     def test_save_then_read_back_in_a_folder_with_spaces_and_arabic_letters(self):
         target = self.root / ARABIC_FOLDER / "store with spaces" / "token.json"
-        saved = token_store.save_token(TOKEN, path=target)
+        try:
+            saved = token_store.save_token(TOKEN, path=target)
+        except RuntimeError as exc:
+            # The save fails closed; show the reason (never the token) in the failure text.
+            self.fail(f"save_token refused: {exc}" + _why())
         self.assertEqual(saved, target)
         self.assertEqual(token_store.load_stored_token(target), TOKEN)
 

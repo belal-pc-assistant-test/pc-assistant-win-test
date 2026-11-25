@@ -17,6 +17,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from ..winshell import sanitize_failure
+
 from ..config import Config
 from .base import (
     IS_WINDOWS,
@@ -179,7 +181,7 @@ def system_info(params: dict[str, str], ctx: ActionContext) -> ActionResult:
         if not report:
             raise ActionError(
                 "Could not read system information. PowerShell said: "
-                f"{(proc.stderr or 'no details')[:200]}"
+                f"{sanitize_failure(proc.stderr, 200)}"
             )
         backend = "Windows / PowerShell"
     else:
@@ -334,7 +336,7 @@ def kill_process(params: dict[str, str], ctx: ActionContext) -> ActionResult:
             command = f"Stop-Process -Name {ps_literal(name)}" + (" -Force" if force else "")
         proc = run_powershell(command, min(config.command_timeout, 30), config.workspace_root)
         if proc.returncode != 0:
-            raise ActionError(f"Could not kill: {(proc.stderr or 'unknown error')[:300]}")
+            raise ActionError(f"Could not kill: {sanitize_failure(proc.stderr, 300)}")
         target = f"PID {pid}" if pid is not None else name
         return ActionResult("kill_process", True, f"Stopped {target}.",
                             duration=time.perf_counter() - started)
@@ -456,7 +458,7 @@ def volume(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     script = VOLUME_PS_TEMPLATE.replace("{codes}", code_list)
     proc = run_powershell(script, min(config.command_timeout, 30), config.workspace_root)
     if proc.returncode != 0:
-        raise ActionError(f"Could not change the volume: {(proc.stderr or '')[:300]}")
+        raise ActionError(f"Could not change the volume: {sanitize_failure(proc.stderr, 300)}")
 
     if mode == "set":
         detail = (f"Volume set to ~{level}% (≈{VOLUME_STEP_PERCENT}% per key press, "
@@ -480,7 +482,7 @@ def lock_screen(params: dict[str, str], ctx: ActionContext) -> ActionResult:
         raise windows_only("Locking the screen")
     proc = run_process(["rundll32.exe", "user32.dll,LockWorkStation"], 15)
     if proc.returncode != 0:
-        raise ActionError(f"Could not lock the screen: {(proc.stderr or '')[:200]}")
+        raise ActionError(f"Could not lock the screen: {sanitize_failure(proc.stderr, 200)}")
     return ActionResult("lock_screen", True, "Screen locked.",
                         duration=time.perf_counter() - started)
 
@@ -490,7 +492,7 @@ def _clipboard_read() -> str:
     if IS_WINDOWS:
         proc = run_powershell("Get-Clipboard -Raw", 20)
         if proc.returncode != 0:
-            raise ActionError(f"Could not read the clipboard: {(proc.stderr or '')[:200]}")
+            raise ActionError(f"Could not read the clipboard: {sanitize_failure(proc.stderr, 200)}")
         return proc.stdout.rstrip("\r\n")
     for tool in (["xclip", "-selection", "clipboard", "-o"],
                  ["xsel", "--clipboard", "--output"],
@@ -508,7 +510,7 @@ def _clipboard_write(text: str) -> None:
         # Passed as base64 data, never pasted into the script (see ps_literal).
         proc = run_powershell(f"Set-Clipboard -Value {ps_literal(text)}", 20)
         if proc.returncode != 0:
-            raise ActionError(f"Could not write the clipboard: {(proc.stderr or '')[:200]}")
+            raise ActionError(f"Could not write the clipboard: {sanitize_failure(proc.stderr, 200)}")
         return
     for tool in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"],
                  ["pbcopy"]):
@@ -575,7 +577,7 @@ def notification(params: dict[str, str], ctx: ActionContext) -> ActionResult:
         proc = run_powershell(script, min(ctx.config.command_timeout, 30),
                               ctx.config.workspace_root)
         if proc.returncode != 0:
-            raise ActionError(f"Could not show the notification: {(proc.stderr or '')[:300]}")
+            raise ActionError(f"Could not show the notification: {sanitize_failure(proc.stderr, 300)}")
     else:
         if not shutil.which("notify-send"):
             raise ActionError("Desktop notifications need Windows or notify-send.")
@@ -709,7 +711,7 @@ def power(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     if proc.returncode != 0:
         raise ActionError(
             f"Power action failed (exit {proc.returncode}): "
-            f"{(proc.stderr or proc.stdout or '')[:200]}"
+            f"{sanitize_failure(proc.stderr or proc.stdout, 200)}"
         )
 
     if mode in {"shutdown", "restart"}:

@@ -31,6 +31,7 @@ from .base import (
     truncate,
     unique_destination,
 )
+from ..winshell import clixml_to_text, sanitize_failure
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +63,9 @@ def powershell(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     parts: list[str] = []
     if (proc.stdout or "").strip():
         parts.append(proc.stdout.rstrip())
-    if (proc.stderr or "").strip():
-        parts.append("— stderr —\n" + proc.stderr.rstrip())
+    stderr_text = clixml_to_text(proc.stderr)
+    if stderr_text.strip():
+        parts.append("— stderr —\n" + stderr_text.rstrip())
     body = "\n\n".join(parts) or "(the command produced no output)"
     return ActionResult(
         "powershell",
@@ -132,7 +134,7 @@ def open_target(params: dict[str, str], ctx: ActionContext) -> ActionResult:
                 min(config.command_timeout, 30), config.workspace_root,
             )
             if proc.returncode != 0:
-                raise ActionError(f"Could not open '{target}': {(proc.stderr or '')[:200]}")
+                raise ActionError(f"Could not open '{target}': {sanitize_failure(proc.stderr, 200)}")
         else:
             raise ActionError(
                 f"Could not open '{target}': {exc}. Is a desktop session available?"

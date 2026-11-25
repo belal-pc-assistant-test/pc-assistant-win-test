@@ -615,7 +615,10 @@ class AclCommandShapeTests(unittest.TestCase):
         self.assertNotIn(self.SID, script)
         self.assertEqual(seen["env"]["TPA_ACL_PATH"], str(odd))
         self.assertEqual(seen["env"]["TPA_ACL_SID"], self.SID)
-        self.assertEqual(seen["args"][:4], ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        # Round 9: the executable is the full Windows PowerShell path (or the bare name), never a PS7 module setup.
+        self.assertTrue(seen["args"][0] == "powershell" or seen["args"][0].lower().endswith("powershell.exe"))
+        self.assertEqual(seen["args"][1:4], ["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        self.assertNotIn("PSModulePath", seen["env"])
 
     def test_script_turns_inheritance_off_and_removes_every_entry(self):
         script = token_store._ACL_APPLY_SCRIPT
@@ -634,6 +637,53 @@ class AclCommandShapeTests(unittest.TestCase):
         with mock.patch.object(token_store.subprocess, "run", side_effect=OSError("no powershell")):
             self.assertIsNone(token_store._run_acl_script(token_store._ACL_READ_SCRIPT,
                                                           Path("x"), self.SID, directory=False))
+
+
+class AclOwnerOnlyPredicateTests(unittest.TestCase):
+    """The read-back decision: only the owner, as the one explicit entry. Closes mutation M8."""
+
+    SID = "S-1-5-21-1-2-3-1001"
+    OTHER = "S-1-5-18"  # SYSTEM
+
+    def owner_only(self, **overrides):
+        report = {"owner": self.SID, "entries": [{"sid": self.SID, "inherited": False}]}
+        report.update(overrides)
+        return report
+
+    def test_owner_only_report_passes(self):
+        self.assertTrue(token_store.acl_is_owner_only(self.owner_only(), self.SID))
+
+    def test_an_extra_explicit_entry_fails(self):
+        report = self.owner_only(entries=[{"sid": self.SID, "inherited": False},
+                                          {"sid": self.OTHER, "inherited": False}])
+        self.assertFalse(token_store.acl_is_owner_only(report, self.SID))
+
+    def test_only_another_account_fails(self):
+        report = self.owner_only(entries=[{"sid": self.OTHER, "inherited": False}])
+        self.assertFalse(token_store.acl_is_owner_only(report, self.SID))
+
+    def test_an_inherited_entry_fails_even_for_the_owner(self):
+        report = self.owner_only(entries=[{"sid": self.SID, "inherited": True}])
+        self.assertFalse(token_store.acl_is_owner_only(report, self.SID))
+
+    def test_an_inherited_flag_that_is_missing_or_not_false_fails(self):
+        for entry in ({"sid": self.SID}, {"sid": self.SID, "inherited": None},
+                      {"sid": self.SID, "inherited": 0}):
+            with self.subTest(entry=entry):
+                self.assertFalse(token_store.acl_is_owner_only(self.owner_only(entries=[entry]), self.SID))
+
+    def test_a_different_owner_fails(self):
+        self.assertFalse(token_store.acl_is_owner_only(self.owner_only(owner=self.OTHER), self.SID))
+
+    def test_an_empty_list_fails_so_a_missing_report_never_passes(self):
+        self.assertFalse(token_store.acl_is_owner_only(self.owner_only(entries=[]), self.SID))
+        self.assertFalse(token_store.acl_is_owner_only({"owner": self.SID}, self.SID))
+
+    def test_missing_report_or_sid_fails(self):
+        self.assertFalse(token_store.acl_is_owner_only(None, self.SID))
+        self.assertFalse(token_store.acl_is_owner_only("not a report", self.SID))
+        self.assertFalse(token_store.acl_is_owner_only(self.owner_only(), ""))
+        self.assertFalse(token_store.acl_is_owner_only(self.owner_only(), None))
 
 
 if __name__ == "__main__":

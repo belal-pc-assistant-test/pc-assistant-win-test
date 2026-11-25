@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 import sys
 import time
 import uuid
@@ -127,17 +128,20 @@ async def capture_frame(owner, width: int, quality: int, title=None, handle=0) -
     """Capture in a short-lived killable child; bytes are returned through a pipe."""
     if owner.stopping or not owner.indicator or not owner.indicator.visible():
         raise SharingError('Screen indicator is not visible.')
+    child_environment = None  # only the Windows PowerShell capture needs the clean environment
     if title is None:
         argv = [sys.executable, '-m', 'assistant.capture_worker', str(width), str(quality)]
     else:
         from .actions.base import powershell_exe
         from .actions.system import WINDOW_SHOT_PS
+        from .winshell import child_env
         title64 = base64.b64encode(title.encode('utf-8')).decode('ascii')
         script = WINDOW_SHOT_PS.replace('{title}', title64).replace('{handle}', str(int(handle)))
         argv = powershell_exe() + [script]
+        child_environment = child_env() if os.name == 'nt' else None
     process = await _spawn(
         *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL, env=child_environment,
     )
     owner.capture_process = process
     try:

@@ -155,6 +155,7 @@ The second line downloads the model (not tested in this build). The model folder
 * The bot refuses to start when it runs as Administrator (`shell32.IsUserAnAdmin`). It prints a message, tries to tell the allowed users on Telegram, and exits with code 5. There is no override flag. `main.py --check` reports this too. The bot does not ask for elevation and does not bypass UAC.
 * File actions refuse the protected names `token.json`, `token.txt` and `.env`, including the same names with trailing dots or spaces and the 8.3 short form `TOKEN~1.TXT`. Writes to the Windows Startup folder are refused. The token is never written to `config.ini` or to plans. Every message the bot sends to Telegram (replies, errors, edited text and captions) has the token replaced with `[REDACTED]`, and a file that contains the token is not sent. The audit log removes it too. Text you type to the bot is kept as you sent it, so never paste the token into the chat.
 * Clipboard text and notification text reach PowerShell encoded as base64, not pasted into the script.
+* PowerShell started by the bot is Windows PowerShell 5, launched by its full path under `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` (the bare name `powershell` is used only if that file is missing). The child process does not receive `PSModulePath` or `PSExecutionPolicyPreference`, so a bot started from PowerShell 7 (`pwsh`) still runs the token-permission step correctly. When a PowerShell step fails, the bot shows one short reason with progress noise removed. Paths and the token are never shown in that reason.
 * Remote: the link secret is at least 32 random bytes and new for each session. Failed attempts are rate-limited: 5 failures in 60 seconds cause a 60-second lockout, and 25 failures in total end the session. Host and Origin headers are checked on every request. Input is accepted only after a viewer authenticates.
 * The `cloudflared` download uses only the official `github.com/cloudflare/cloudflared/releases/` path, caps its size, and runs `cloudflared --version` before use.
 * The bot creates no Windows service, scheduled task, Run key or Startup entry. Dependencies are pinned in `requirements.txt`.
@@ -168,7 +169,7 @@ The second line downloads the model (not tested in this build). The model folder
 * **Protections are name-based.** A copy of a credential under another name is not detected.
 * **Voice packages are range-pinned.** `requirements-voice.txt` pins `av` to `>=12,<16`, not one exact version, so a new release inside that range can be installed. `requirements.txt` is fully exact-pinned.
 * **Telegram keeps what it receives**, including results, uploads and plans.
-* **Not validated live on Windows:** PowerShell actions, clipboard, process control, DPAPI, screen capture, the banner, the `cloudflared` runtime, live Telegram, the owner-only access list, junctions, the Administrator check on a real elevated process, and `/pause` across a real restart. These were tested with fakes or on Linux. The Windows-only tests in `tests/test_windows_real.py` are the check for them; they run on the GitHub Windows runner.
+* **Not validated live on Windows:** the PowerShell launch fix (a child Windows PowerShell started from `pwsh`) and its effect on the token-permission step, PowerShell actions, clipboard, process control, DPAPI, screen capture, the banner, the `cloudflared` runtime, live Telegram, the owner-only access list, junctions, the Administrator check on a real elevated process, and `/pause` across a real restart. These were tested with fakes or on Linux. The Windows-only tests in `tests/test_windows_real.py` are the check for them; they run on the GitHub Windows runner.
 * **Access list and other programs.** Removing SYSTEM and Administrators from the token file means a backup or security product that runs as SYSTEM may no longer read it. Your own account still can.
 * **Cloudflared pin:** the default download is `releases/latest`, so the version changes over time. Set `cloudflared_sha256` to pin it.
 
@@ -187,7 +188,7 @@ The second line downloads the model (not tested in this build). The model folder
 
 ### Token not saved on Windows
 
-If `install.bat` or `set_token.bat` says the token was not saved, Windows would not restrict the file to your account. The bot refuses to leave a readable plain-text token behind. Create `token.txt` next to `install.bat` instead, or run the command again from your normal user account.
+If `install.bat` or `set_token.bat` says the token was not saved, Windows would not restrict the file to your account. The bot refuses to leave a readable plain-text token behind. The message ends with `PowerShell said: …` when PowerShell gave a reason; that reason never contains the token or a full path. Create `token.txt` next to `install.bat` instead, or run the command again from your normal user account.
 
 ### The bot says it is running as Administrator
 
@@ -233,4 +234,4 @@ Delete `token.txt` yourself. Run `main.py --forget-token` to remove the stored t
 python build_zip.py
 ```
 
-`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. `tests/test_windows_real.py` holds the tests that need real Windows (the owner-only access list, the token file, the loopback server, path rules, junctions, log handles, the Administrator check). They skip everywhere else. Run them on a Windows PC or a Windows CI runner. `tests/test_round8.py` covers the Round 8 changes on Linux.
+`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. `tests/test_windows_real.py` holds the tests that need real Windows (the owner-only access list, the token file, the loopback server, path rules, junctions, log handles, the Administrator check). They skip everywhere else. Run them on a Windows PC or a Windows CI runner. `tests/test_round8.py` covers the Round 8 changes on Linux. `tests/test_powershell_launch.py` covers how PowerShell is started (full path, clean environment, sanitized reasons) with a stubbed `subprocess`, also on Linux.
