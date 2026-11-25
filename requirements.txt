@@ -1,0 +1,15 @@
+# Telegram PC Assistant — Python dependencies
+# Installed with:  pip install -r requirements.txt
+
+# Telegram Bot API client (async, v21.x)
+python-telegram-bot==21.6
+
+# HTTP client, used for the cloud planner (Pollinations) and Ollama
+requests>=2.31,<3
+
+# Screen capture on Windows (ImageGrab)
+Pillow>=10.4,<14
+
+# Strict JSON-schema validation of the plans the models return.
+# The built-in validator is used automatically if this is missing.
+jsonschema>=4.20,<5

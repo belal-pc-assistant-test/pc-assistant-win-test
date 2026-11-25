@@ -1,0 +1,327 @@
+"""Shared plumbing for all actions: results, paths, subprocesses, aborts."""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Protocol, runtime_checkable
+
+from ..config import Config
+
+IS_WINDOWS = os.name == "nt"
+
+WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|\\\\)")
+
+
+# ---------------------------------------------------------------------------
+# Errors and results
+# ---------------------------------------------------------------------------
+
+class ActionError(RuntimeError):
+    """Raised when a step cannot run (bad input, blocked, missing tool...)."""
+
+
+@dataclass
+class ActionResult:
+    action: str
+    ok: bool
+    output: str = ""
+    files: list[Path] = field(default_factory=list)
+    files_as_document: bool = True
+    duration: float = 0.0
+
+    @property
+    def has_files(self) -> bool:
+        return bool(self.files)
+
+
+@runtime_checkable
+class Transport(Protocol):
+    """What an action may need from the Telegram side (file downloads)."""
+
+    def download_file(self, file_id: str, destination: Path) -> int:
+        """Download ``file_id`` to ``destination``; return bytes written."""
+
+
+@dataclass
+class ActionContext:
+    """Everything a handler needs besides its own params."""
+
+    config: Config
+    transport: Transport | None = None
+    jobs: Any = None          # assistant.jobs.JobStore (set by the bot)
+    chat_id: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Abort support (/panic)
+# ---------------------------------------------------------------------------
+
+class ProcessRegistry:
+    """Keeps track of live child processes so /panic can terminate them."""
+
+    def __init__(self) -> None:
+        self._procs: set[subprocess.Popen] = set()
+        self._lock = threading.Lock()
+
+    def add(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.add(proc)
+
+    def discard(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def kill_all(self) -> int:
+        with self._lock:
+            procs = list(self._procs)
+        killed = 0
+        for proc in procs:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    killed += 1
+            except Exception:
+                continue
+        return killed
+
+    @property
+    def running(self) -> int:
+        with self._lock:
+            return sum(1 for p in self._procs if p.poll() is None)
+
+
+REGISTRY = ProcessRegistry()
+_ABORT = threading.Event()
+
+
+def request_abort() -> None:
+    """Set by /panic: stop the current plan and kill its child processes."""
+    _ABORT.set()
+    REGISTRY.kill_all()
+
+
+def clear_abort() -> None:
+    _ABORT.clear()
+
+
+def abort_requested() -> bool:
+    return _ABORT.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def truncate(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n\n… output truncated ({len(text)} characters total)."
+
+
+def expand(raw: str) -> str:
+    raw = (raw or "").strip().strip('"').strip("'")
+    return os.path.expandvars(os.path.expanduser(raw))
+
+
+def effective_roots(config: Config) -> list[Path]:
+    """Folders that file actions may touch.
+
+    ``[paths] allowed_roots`` when set, otherwise the working folder. File
+    transfer actions always stay inside these folders.
+    """
+    return list(config.allowed_roots) or [config.workspace_root]
+
+
+def ensure_inside(path: Path, roots: Iterable[Path], what: str = "Path") -> Path:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return path
+        except ValueError:
+            continue
+    raise ActionError(
+        f"{what} is outside the allowed folders "
+        f"({', '.join(str(r) for r in roots)}): {path}"
+    )
+
+
+def resolve_path(raw: str, config: Config, what: str = "Path") -> Path:
+    """Turn user/model input into an absolute, allow-list-checked path."""
+    cleaned = expand(raw)
+    if not cleaned:
+        return config.workspace_root
+    path = Path(cleaned)
+    if not path.is_absolute() and not WINDOWS_PATH_RE.match(cleaned):
+        path = config.workspace_root / path
+    path = path.resolve()
+    if config.allowed_roots:
+        ensure_inside(path, config.allowed_roots, what)
+    return path
+
+
+def resolve_in_roots(raw: str, config: Config, what: str = "Path") -> Path:
+    """Like :func:`resolve_path`, but always confined to the effective roots."""
+    cleaned = expand(raw)
+    if not cleaned:
+        base = effective_roots(config)[0]
+        return base.resolve()
+    path = Path(cleaned)
+    if not path.is_absolute() and not WINDOWS_PATH_RE.match(cleaned):
+        base = effective_roots(config)[0]
+        path = base / path
+    return ensure_inside(path.resolve(), [p.resolve() for p in effective_roots(config)], what)
+
+
+def sanitize_filename(name: str, fallback: str = "download.bin") -> str:
+    """Strip directory parts and characters Windows cannot store."""
+    raw = (name or "").replace("\\", "/").split("/")[-1].strip()
+    raw = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw)
+    raw = raw.strip(" .")
+    if not raw or raw in {".", ".."}:
+        return fallback
+    return raw[:180]
+
+
+def unique_destination(folder: Path, filename: str) -> Path:
+    """Return a non-existing path inside ``folder`` (adds " (1)" when needed)."""
+    candidate = folder / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    for index in range(1, 1000):
+        alternative = folder / f"{stem} ({index}){suffix}"
+        if not alternative.exists():
+            return alternative
+    raise ActionError(f"Could not find a free filename in {folder}")
+
+
+def run_process(
+    argv: list[str],
+    timeout: float,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a child process that /panic can kill; never leaves zombies behind."""
+    if abort_requested():
+        raise ActionError("Aborted by /panic before starting.")
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "cwd": str(cwd) if cwd and Path(cwd).is_dir() else None,
+        "env": env,
+    }
+    try:
+        proc = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
+    except OSError as exc:
+        raise ActionError(f"Could not start process: {exc}") from exc
+
+    REGISTRY.add(proc)
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise ActionError(
+                f"Command timed out after {timeout:.0f}s and was killed."
+            ) from None
+    finally:
+        REGISTRY.discard(proc)
+
+    if abort_requested():
+        raise ActionError("Aborted by /panic.")
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def powershell_exe() -> list[str]:
+    """Executable + flags to run a PowerShell command."""
+    if IS_WINDOWS:
+        for candidate in ("powershell", "pwsh"):
+            exe = shutil.which(candidate)
+            if exe:
+                return [
+                    exe, "-NoProfile", "-NonInteractive", "-Command",
+                ]
+        raise ActionError("PowerShell was not found on this system.")
+    pwsh = shutil.which("pwsh")
+    if pwsh:
+        return [pwsh, "-NoProfile", "-NonInteractive", "-Command"]
+    raise ActionError("PowerShell is only available on Windows.")
+
+
+def run_powershell(command: str, timeout: float, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """Run PowerShell with UTF-8 output forced (so Arabic survives)."""
+    wrapped = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "try { chcp 65001 > $null } catch {}; "
+        f"{command}"
+    )
+    return run_process(powershell_exe() + [wrapped], timeout, cwd)
+
+
+def windows_only(feature: str) -> ActionError:
+    return ActionError(f"{feature} is only available on Windows.")
+
+
+def hostname_and_ip() -> tuple[str, str]:
+    import socket
+
+    try:
+        host = socket.gethostname()
+    except Exception:
+        host = "?"
+    ip = "?"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+    except Exception:
+        try:
+            ip = socket.gethostbyname(host)
+        except Exception:
+            ip = "?"
+    return host, ip
+
+
+def human_bytes(size: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def human_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def python_executable() -> str:
+    return sys.executable or "python"

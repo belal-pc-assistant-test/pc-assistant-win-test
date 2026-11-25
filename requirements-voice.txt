@@ -1,0 +1,4 @@
+# Optional local voice transcription. PyAV 19 breaks faster-whisper 1.2.1's
+# metadata_errors argument; keep a tested compatible PyAV major version.
+faster-whisper==1.2.1
+av>=12,<16
