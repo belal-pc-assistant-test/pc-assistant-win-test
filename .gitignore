@@ -10,6 +10,8 @@ logs/
 screenshots/
 downloads/
 data/
+# Downloaded cloudflared.exe and other on-demand tools (never shipped in the ZIP)
+tools/
 models/
 *.log
 

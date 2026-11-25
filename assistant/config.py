@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -211,6 +212,13 @@ class Config:
     voice_model_path: Path
     config_path: Path = field(default=DEFAULT_CONFIG_PATH)
 
+    # --- Remote desktop (/remote) -------------------------------------
+    remote_default_minutes: int = 15
+    remote_max_minutes: int = 60
+    remote_tunnel_order: list[str] = field(default_factory=lambda: ["cloudflare", "localhost.run"])
+    cloudflared_sha256: str = ""
+    tools_dir: Path = field(default_factory=lambda: PROJECT_DIR / "tools")
+
     # ------------------------------------------------------------------
     @property
     def log_dir(self) -> Path:
@@ -360,6 +368,21 @@ def load_config(path: str | Path | None = None) -> Config:
         _get_str(paths, "screenshots_dir", "screenshots"), PROJECT_DIR
     )
 
+    remote = parser["remote"] if "remote" in parser else parser["DEFAULT"]
+    remote_default = _get_int(remote, "default_minutes", 15)
+    remote_max = _get_int(remote, "max_minutes", 60)
+    if not 1 <= remote_max <= 60:
+        raise ConfigError("[remote] max_minutes must be between 1 and 60.")
+    if not 1 <= remote_default <= remote_max:
+        raise ConfigError("[remote] default_minutes must be between 1 and max_minutes.")
+    tunnel_order = [item.lower() for item in _split_list(remote.get("tunnel_order"))] or ["cloudflare", "localhost.run"]
+    unknown_providers = [item for item in tunnel_order if item not in ("cloudflare", "localhost.run")]
+    if unknown_providers:
+        raise ConfigError(f"[remote] tunnel_order has unknown providers: {', '.join(unknown_providers)}")
+    pinned = _get_str(remote, "cloudflared_sha256", "").lower()
+    if pinned and not re.fullmatch(r"[0-9a-f]{64}", pinned):
+        raise ConfigError("[remote] cloudflared_sha256 must be 64 hexadecimal characters or empty.")
+
     return Config(
         bot_token=bot_token,
         token_source=token_source,
@@ -397,4 +420,9 @@ def load_config(path: str | Path | None = None) -> Config:
         jobs_file=jobs_file,
         voice_model_path=_resolve_dir(_get_str(voice, "model_path", "models/faster-whisper-tiny"), PROJECT_DIR),
         config_path=config_path,
+        remote_default_minutes=remote_default,
+        remote_max_minutes=remote_max,
+        remote_tunnel_order=tunnel_order,
+        cloudflared_sha256=pinned,
+        tools_dir=_resolve_dir(_get_str(remote, "tools_dir", "tools"), PROJECT_DIR),
     )

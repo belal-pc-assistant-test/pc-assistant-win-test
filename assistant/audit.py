@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -87,11 +88,19 @@ def close() -> None:
 
 # Audit metadata only: never store requests, transcripts, notes, commands,
 # output, exception text, paths or other potentially secret-bearing content.
-_SAFE_FIELDS = {'user_id', 'chat_id', 'step', 'ok', 'duration', 'failed', 'aborted', 'killed', 'jobs'}
+_SAFE_FIELDS = {'user_id', 'chat_id', 'step', 'ok', 'duration', 'failed', 'aborted', 'killed', 'jobs',
+                'minutes', 'frames', 'inputs', 'viewers', 'rejected'}
+# Text is allowed only for a few labels that our own code produces (reasons, provider
+# names). Anything that is not a short plain label is dropped, so URLs, secrets or
+# request text can never reach the log through these fields.
+_SAFE_TEXT_FIELDS = {'reason', 'provider'}
+_SAFE_TEXT_RE = re.compile(r'[a-z][a-z .\-]{0,39}')  # lowercase labels only; tokens never match
 
 def event(kind: str, **fields: Any) -> None:
     payload = {"event": kind, "ts": datetime.now().isoformat(timespec="seconds")}
     payload.update({k: v for k, v in fields.items() if k in _SAFE_FIELDS and isinstance(v, (int, float, bool))})
+    payload.update({k: v for k, v in fields.items()
+                    if k in _SAFE_TEXT_FIELDS and isinstance(v, str) and _SAFE_TEXT_RE.fullmatch(v)})
     _LOGGER.info(json.dumps(payload, ensure_ascii=False))
 
 

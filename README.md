@@ -84,6 +84,8 @@ Windows-specific actions need Windows and a usable desktop session. File transfe
 | `/screen`, `/window [title]` | Propose one full-screen or window-only JPEG photo; approve each capture. Without a title the foreground window at capture time is used. |
 | `/watch start [seconds] [minutes]` | Propose a temporary full-desktop sharing session; default 3 seconds and 10 minutes. |
 | `/watch speed N`, `/watch stop` | Propose an interval change (2–60 seconds) or stop immediately without approval. |
+| `/remote start [minutes]` | Propose a private remote-desktop session with **full view and mouse/keyboard control** for 1–60 minutes (default 15). One approval starts it. See [Remote desktop](#remote-desktop-remote). |
+| `/remote status`, `/remote stop` | Show the session state (never the link), or end it now and close the tunnel. |
 | `/note TEXT` | Propose adding a note. Approve to save it locally. |
 | `/notes` | Propose sending your saved numbered notes to this chat. |
 | `/forget N` | Propose deleting note number N; checks it has not changed. `/forget language` removes the preference; `/forget all` removes notes, macros and preferences (not jobs). |
@@ -104,6 +106,42 @@ Plans expire after 15 minutes; deny or expiry means a due one-time reminder or c
 `/screen` and `/window [title]` each produce a plan; approve with Yes or `approve CODE` before any capture. A title is matched case-insensitively; without one the foreground window is selected immediately before showing the indicator. Ambiguous titles select the first match. Some windows block capture or produce blank images; no full-screen fallback is attempted. A visible red topmost indicator is required during capture and upload, including one-shot photos. Its local **Stop screen sharing** button ends the operation.
 
 `/watch start [seconds] [minutes]` proposes sharing the full desktop, including all visible screens. Defaults are **3 seconds and 10 minutes**; bounds are 2–60 seconds and 1–60 minutes. Approve once to start. The assistant sends a start notice, a photo, then updates that message with resized JPEG frames (maximum width 1280). `/watch speed N` proposes an approved change; `/watch stop` or `/panic` cancels immediately. A stop notice is sent when possible. Frames are sequential: slow uploads skip missed frames, Telegram rate-limit responses cause backoff, and failed edits can fall back to a fresh photo no more than once every 30 seconds. Network errors may prevent notices or updates. If the indicator closes, disappears, or stops reporting visibility, sharing stops; local GUI scheduling and heartbeat detection are best effort, not a tamper-proof guarantee. The remote stop cancels in-progress work, but an upload already sent to Telegram may still arrive and cannot be recalled. Telegram itself can retain photos and message history. No screenshot file is created; in-memory buffers are discarded after use. Capture requires a private chat whose ID equals the allowed requesting user ID. This feature uses no keylogger, webcam, or microphone. The separately optional voice-note feature accepts audio users deliberately send through Telegram; it does not activate the PC microphone.
+
+### Remote desktop (`/remote`)
+
+`/remote start [minutes]` proposes a session that gives **full view and control** of this PC: you see the screen and your mouse and keyboard drive it, for the chosen time (1–60 minutes, default 15). Only the allowed user in a private chat can request it, and nothing starts until you approve the plan with Yes or `approve CODE`. The approval text states the time and that control is included.
+
+After approval the assistant:
+
+1. shows an **always-on-top red banner** on the PC with the time remaining, the stop hint `Ctrl+Alt+Shift+Q`, and a **Stop** button;
+2. starts a viewer server bound to `127.0.0.1` only and opens a public tunnel to it (Cloudflare quick tunnel first; the `localhost.run` SSH tunnel is the fallback). If the Cloudflare program is missing, it is downloaded once from the official `github.com/cloudflare/cloudflared/releases` address into `tools\`, then must run and identify itself before use;
+3. sends **one private link** to your chat in a separate message, marked as not forwardable (Telegram's protection only applies inside the Telegram app).
+
+Open the link in a browser. It works **once**: the first visit locks the secret and gives that browser a session cookie. A second visit with the same link gets 403. Only one viewer connection is accepted at a time. The viewer shows the measured frame rate, latency, and remaining time.
+
+The session ends when you press **Stop** on the banner, press `Ctrl+Alt+Shift+Q`, send `/remote stop`, send `/panic`, reach the time limit, the banner or tunnel stops responding, or the bot shuts down. Every ending revokes the link and cookie, releases held keys and mouse buttons, closes the viewer connection, and kills the tunnel program. Telegram gets a stop notice. `/remote status` never displays the link.
+
+**Security design**
+
+* Only the allowed user ID in a private chat can request a session. A session needs a fresh approval, and a stop cancels any pending request that has not been approved yet. Starting a session is not possible from free-text, planner output, or macros.
+* The link secret is 32 or more random bytes, new for every session, and compared in constant time. Requests without the cookie or a valid secret get 403. Failed attempts are rate-limited: 5 failures within 60 seconds lock out further attempts for 60 seconds, and 25 failures in total end the session.
+* When the browser sends an Origin header (all browsers do for WebSockets), the connection is accepted only from the tunnel's own address. The viewer page loads no external resources and sends a restrictive content-security policy.
+* Viewer input is validated (types, ranges and key names), rate-limited, and sent only while the session is active. Typed text is never logged.
+* Nothing is written to disk: screen frames stay in memory, and the audit log records only timestamps, counts, and short reason labels (no secrets, links, keystrokes, or screen content).
+* No hidden mode, no autostart, and no persistence: a restart ends any session. There is no keylogger, no microphone, and no webcam use.
+
+**Limits and risks: please read before using**
+
+* **Free tunnels are flaky.** Cloudflare quick tunnels and `localhost.run` have no uptime guarantee and can be slow, refuse to start, or drop mid-session. If no tunnel opens, nothing is exposed and the bot says so. The session also ends if the tunnel dies.
+* **The localhost.run fallback is unverified live.** Its free service terms and sign-in requirements can change (its welcome text has mentioned SSH keys); if it refuses the connection, only the Cloudflare tunnel is available.
+* **Tunnel providers carry the traffic.** Screen content and typed input pass through the tunnel provider's network. Do not use a session for sensitive material you would not give that provider.
+* **The link must stay private.** Anyone who gets the link can use it until it is first opened; after that, anyone holding the browser's cookie can view and control the PC until the session ends. Forwarding it is equivalent to handing over the PC. Delete the link message after use, because Telegram keeps chat history.
+* **UAC prompts and admin or secure-desktop windows cannot be controlled.** Windows blocks normal programs from sending input there, so the viewer can see nothing and the assistant's input is refused. Ctrl+Alt+Del and the lock screen are out of reach.
+* **Weak PCs lower the frame rate.** The target is 5–10 frames per second with adaptive JPEG quality (maximum width 1280). Slow CPUs, slow networks, and high-resolution screens reduce both frame rate and detail, and add latency.
+* **Some keys may not reach the PC.** Browser shortcuts and the Windows key may be intercepted by the browser or Windows.
+* **The hotkey is unverified live.** `Ctrl+Alt+Shift+Q` is registered through Windows `RegisterHotKey` in the banner process. This could not be tested in the development sandbox, so confirm it on your PC. The Stop button and `/remote stop` do not depend on it.
+* **Windows-only.** Capture, input, the banner, PowerShell, and live Telegram behavior can only be confirmed on the target Windows PC. The offline tests cover the logic around them.
+* **Risks overview:** a leaked link or a compromised Telegram account gives control of the PC for as long as the session lasts (keep the default 15 minutes); tunnel providers see the traffic; the `cloudflared` download depends on GitHub and optionally on the SHA-256 pin in `[remote]`; if the bot process is killed abruptly, the tunnel program is stopped by a Windows job object only on a best-effort basis.
 
 ### Optional local voice notes
 
@@ -144,6 +182,8 @@ From a console in the project folder:
 | `[paths] downloads_dir` | Uploaded files location; must lie within allowed roots (or workspace root if roots are empty). Legacy screenshot-path settings are ignored for screen photos. |
 | `[paths] jobs_file`, `log_file` | Persistent jobs and metadata-only audit log. Memory is `memory.json` next to the jobs file. These files are not tamper-proof; restrict OS permissions. |
 | `[voice] model_path` | Local faster-whisper model directory; no automatic model download. |
+| `[remote] default_minutes`, `max_minutes` | Remote session length (default 15, maximum 60). |
+| `[remote] tunnel_order`, `tools_dir`, `cloudflared_sha256` | Tunnel providers in order, the on-demand tools folder, and an optional SHA-256 pin for `cloudflared.exe`. |
 
 Scheduled jobs use the PC's local time and are checked about every 15 seconds while the program runs. Missed jobs can be queued after restart, but always need a new approval. Someone with write access to local job/memory files can alter what is proposed; review the exact plan, and protect these files from other users. The audit log rotates. Screen photos are held in memory, not saved as screenshot files; Telegram retains sent photos according to its own policies.
 
@@ -157,9 +197,11 @@ Scheduled jobs use the PC's local time and are checked about every 15 seconds wh
 * Check `logs\assistant.log`, `/status`, and `check_setup.bat`; current logs are metadata-only, but old logs may contain sensitive information.
 * Voice setup fails: check that the optional package and local model were installed in this project; install the pinned PyAV dependency from `requirements-voice.txt`. Some machines or Python versions may not have compatible wheels.
 * "outside the allowed folders" for a folder you did allow: make sure the path exists; every configured root and requested path is normalized the same way (symlinks, Windows 8.3 short names like `C:\Users\RUNNER~1\…` vs `C:\Users\runneradmin\…`, and case differences on Windows), so both spellings of the same folder are accepted.
+* Remote session does not open: check the internet connection, then retry; `main.py --check` reports cloudflared and ssh availability. Free tunnels can fail at any time.
+* Remote viewer shows a 403: the link was already used, expired, or stopped. Start a new session with `/remote start`.
 * Garbled console output or `UnicodeEncodeError` on Windows: entry points reconfigure stdout/stderr to UTF-8 with `errors=replace`; the installers also run `chcp 65001`.
 
-The offline automated tests exercise planner validation, mocked networking, approval flow, action safety, the .bat launchers' cmd block rules and Windows path/encoding handling. Windows APIs, DPAPI, GUI interaction and real Telegram end-to-end behavior require testing on the target Windows PC; these cannot be guaranteed by the offline tests.
+The offline automated tests exercise planner validation, mocked networking, approval flow, action safety, the .bat launchers' cmd block rules and Windows path/encoding handling. The remote-desktop tests cover secret handling, the single-use lock, expiry, rate limits, the loopback server and WebSocket framing, frame-rate adaptation, input validation, banner and tunnel protocol parsing, start authorization, and stop/panic teardown, with banner, tunnel, capture, and input replaced by fakes. Windows APIs, DPAPI, GUI interaction and real Telegram end-to-end behavior require testing on the target Windows PC; these cannot be guaranteed by the offline tests.
 
 To uninstall, run `main.py --forget-token` before deleting the project (and remove `token.txt` yourself), remove any startup shortcut, remove `%APPDATA%\TelegramPCAssistant` if desired, and delete/revoke the bot in BotFather.
 

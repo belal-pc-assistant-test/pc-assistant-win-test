@@ -13,6 +13,7 @@ import asyncio
 import html
 import json
 import platform
+import sys
 from urllib.parse import urlparse
 import re
 import time
@@ -60,6 +61,8 @@ from .voice import transcribe, VoiceUnavailable, MAX_VOICE_BYTES, MAX_VOICE_SECO
 from .sharing import (ScreenIndicator, WatchController, CaptureLease, capture_frame, photo_stream, foreground_window_handle,
                       MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL, DEFAULT_MINUTES, MAX_MINUTES)
 from .planner import build_plan, PlannerError
+from .remote.session import RemoteController
+from .remote.runtime import make_deps as make_remote_deps
 
 MAX_TG_LEN = 4000
 PLAN_TTL_SECONDS = 15 * 60      # a pending plan expires after 15 minutes
@@ -103,6 +106,8 @@ MSG = {
         "/screen – full-screen photo; /window [title] – window photo (approval required)\n"
         "/watch start [seconds] [minutes] – visible screen sharing; /watch speed N – change speed with approval\n"
         "/watch stop – stop immediately; default 3s/10min, min 2s, max 60min\n"
+        "/remote start [minutes] – private remote desktop: full view AND mouse/keyboard control; one approval; default 15, max 60 min\n"
+        "/remote status – session state (never the link) · /remote stop – end now and close the tunnel\n"
         "A visible indicator is required; photos are sent only to allowed private chats.\n"
         "/note TEXT – save a note; /notes – view notes; /forget N|language|all – forget memory\n"
         "/language en|ar – save a language preference\n"
@@ -154,6 +159,7 @@ class PendingPlan:
     plan: Plan
     created_at: float
     watch_epoch: int = 0
+    remote_epoch: int = 0
     message_refs: list[tuple[int, int]] = field(default_factory=list)
 
 
@@ -225,6 +231,7 @@ _FRIENDLY = {
     "screenshot": ("Capture the full screen and send the photo with a visible indicator.", "سيتم التقاط الشاشة وإرسال الصورة إلى تيليجرام مع إظهار مؤشر واضح."),
     "window_screenshot": ("Capture the requested window only; no full-screen fallback. A visible indicator is required.", "سيتم تصوير النافذة فقط مع إظهار مؤشر واضح، دون التقاط الشاشة كاملة عند الفشل."),
     "watch_start": ("Start visible, temporary full-screen sharing to this private chat until stopped or timed out.", "ستبدأ مشاركة الشاشة كاملة بشكل واضح ومؤقت إلى هذه المحادثة حتى الإيقاف أو انتهاء المدة."),
+    "remote_start": ("Give full view and mouse/keyboard control of this PC through a private link until the time ends or you stop it.", "سيتم منحك رؤية كاملة وتحكماً بالفأرة ولوحة المفاتيح في هذا الجهاز عبر رابط خاص حتى انتهاء المدة أو إيقافها."),
     "watch_speed": ("Change the interval of the existing visible sharing session.", "سيتم تغيير مدة التحديث لجلسة المشاركة الحالية المرئية."),
     "open": ("Open the specified target on the PC.", "سيتم فتح العنصر المحدد على الجهاز."),
     "open_url": ("Open the URL in a browser.", "سيتم فتح الرابط في المتصفح."),
@@ -578,9 +585,12 @@ async def cmd_panic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     running_before = REGISTRY.running
     request_abort()  # act before network waits
     context.application.bot_data["watch_epoch"] = context.application.bot_data.get("watch_epoch", 0) + 1
+    context.application.bot_data["remote_epoch"] = context.application.bot_data.get("remote_epoch", 0) + 1
     controller = context.application.bot_data.get("watch_controller")
     if controller is not None:
         controller.stop_now("panic")
+    remote = context.application.bot_data.get("remote_controller")
+    remote_stopped = await remote.stop("panic") if remote is not None else False
     lease = context.application.bot_data.get("screen_capture_lease")
     if lease is not None:
         lease.stop_now()
@@ -597,6 +607,7 @@ async def cmd_panic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🛑 <b>Panic</b>\n"
         f"• Pending plans cancelled: {len(cancelled)}\n"
         f"• Running processes killed: {running_before}\n"
+        f"• Remote session stopped: {'yes' if remote_stopped else 'none was running'}\n"
         "Send a new request when you are ready.",
         parse_mode=ParseMode.HTML,
     )
@@ -772,6 +783,8 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
     panic_epoch = context.application.bot_data.get("panic_epoch", 0)
     watch_epoch = context.application.bot_data.get("watch_epoch", 0)
     watch_plan = any(s.action in {"watch_start", "watch_speed"} for s in plan.steps)
+    remote_plan = any(s.action == "remote_start" for s in plan.steps)
+    remote_epoch = context.application.bot_data.get("remote_epoch", 0)
     versions = context.application.bot_data.setdefault("proposal_versions", {})
     proposal_key = (user.id, chat_id)
     version = versions.get(proposal_key, 0) + 1
@@ -788,7 +801,8 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if (context.application.bot_data.get("panic_epoch", 0) != panic_epoch or
             versions.get(proposal_key) != version or
-            (watch_plan and context.application.bot_data.get("watch_epoch", 0) != watch_epoch)):
+            (watch_plan and context.application.bot_data.get("watch_epoch", 0) != watch_epoch) or
+            (remote_plan and context.application.bot_data.get("remote_epoch", 0) != remote_epoch)):
         return None
     code = unique_code([p.code for p in store.values()])
     pending = PendingPlan(
@@ -800,6 +814,7 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
         plan=plan,
         created_at=time.time(),
         watch_epoch=watch_epoch,
+        remote_epoch=remote_epoch,
     )
     store[pending.plan_id] = pending
 
@@ -847,7 +862,8 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if (context.application.bot_data.get("panic_epoch", 0) != panic_epoch or
             versions.get(proposal_key) != version or store.get(pending.plan_id) is not pending or
-            (watch_plan and context.application.bot_data.get("watch_epoch", 0) != watch_epoch)):
+            (watch_plan and context.application.bot_data.get("watch_epoch", 0) != watch_epoch) or
+            (remote_plan and context.application.bot_data.get("remote_epoch", 0) != remote_epoch)):
         store.pop(pending.plan_id, None)
         await _mark_messages(context, pending, "🛑 Cancelled by /panic or a newer request.")
         return None
@@ -1111,6 +1127,11 @@ async def _execute_claimed_plan(update: Update, context: ContextTypes.DEFAULT_TY
                 result = ActionResult(step.action, False, "Sharing was stopped after this plan was proposed.")
             else:
                 result = await _run_watch_action(step, pending, context, config)
+        elif step.action == "remote_start":
+            if pending.remote_epoch != context.application.bot_data.get("remote_epoch", 0):
+                result = ActionResult(step.action, False, "Remote session was stopped after this plan was proposed.")
+            else:
+                result = await _run_remote_start(step, pending, context, config)
         else:
             result = await asyncio.to_thread(execute_step, step, config, transport, jobs, chat_id)
         audit.event("action_result", user_id=approved_by, code=pending.code, step=index,
@@ -1359,8 +1380,8 @@ async def cmd_macro(update, context):
             await update.effective_message.reply_text('First request a multi-step plan, then send /macro save NAME before approving it.')
             return
         plan = existing[-1].plan
-        if any(step.action in {'memory_update', 'briefing_schedule', 'job_cancel'} for step in plan.steps):
-            await update.effective_message.reply_text('Personal-memory and scheduler changes cannot be saved as macros.')
+        if any(step.action in {'memory_update', 'briefing_schedule', 'job_cancel', 'remote_start'} for step in plan.steps):
+            await update.effective_message.reply_text('Personal-memory, scheduler and remote-session steps cannot be saved as macros.')
             return
         steps = json.dumps([{'action': st.action, 'params': st.params} for st in plan.steps], ensure_ascii=False, sort_keys=True)
         await _direct(update, context, 'Save the following steps as a macro', 'memory_update', {'op': 'save_macro', 'name': name, 'steps': steps})
@@ -1599,6 +1620,93 @@ async def cmd_watch(update, context):
 
 
 
+def _remote_controller(context, config) -> RemoteController:
+    data = context.application.bot_data
+    if "remote_controller" not in data:
+        factory = data.get("remote_deps_factory") or (
+            lambda chat_id: make_remote_deps(context.bot, config, chat_id))
+        platform_ok = data.get("remote_platform_ok") or (lambda: sys.platform == "win32")
+        data["remote_controller"] = RemoteController(
+            is_allowed=config.is_allowed, max_minutes=config.remote_max_minutes,
+            default_minutes=config.remote_default_minutes, deps_factory=factory,
+            platform_ok=platform_ok,
+        )
+    return data["remote_controller"]
+
+
+async def _run_remote_start(step, pending, context, config):
+    """Runs only after an approver confirmed the plan. The link is sent in its own message."""
+    if pending.chat_id != pending.requester_id or not config.is_allowed(pending.requester_id):
+        return ActionResult(step.action, False, "Remote sessions are restricted to the allowed private chat.")
+    try:
+        minutes = int(step.params.get("minutes", ""))
+    except (ValueError, TypeError):
+        return ActionResult(step.action, False, "Invalid remote session duration.")
+    controller = _remote_controller(context, config)
+    ok, message = await controller.start(pending.requester_id, pending.chat_id, minutes)
+    return ActionResult(step.action, ok, message)
+
+
+REMOTE_USAGE = ("Usage: /remote start [minutes] (1–60, default 15) · /remote status · /remote stop")
+
+
+@owner_only
+async def cmd_remote(update, context):
+    config: Config = context.application.bot_data["config"]
+    message = update.effective_message
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    args = [arg.lower() for arg in (context.args or [])]
+    controller = _remote_controller(context, config)
+    if not args:
+        await message.reply_text(REMOTE_USAGE)
+        return
+    op = args[0]
+    if op == "status" and len(args) == 1:
+        await message.reply_text(controller.status_text())
+        return
+    if op == "stop" and len(args) == 1:
+        data = context.application.bot_data
+        data["remote_epoch"] = data.get("remote_epoch", 0) + 1
+        store = data["plans"]
+        cancelled = [p for p in list(store.values()) if p.requester_id == user_id
+                     and any(st.action == "remote_start" for st in p.plan.steps)]
+        for pending in cancelled:
+            store.pop(pending.plan_id, None)
+        for pending in cancelled:
+            await _mark_messages(context, pending, "⏹ Remote session request cancelled.")
+        stopped = await controller.stop("requested")
+        if stopped:
+            await message.reply_text("⏹ Remote session stopped. The link no longer works.")
+        elif cancelled:
+            await message.reply_text("No remote session was running; the pending request was cancelled.")
+        else:
+            await message.reply_text("No remote session is running.")
+        return
+    if op == "start" and len(args) <= 2:
+        if chat_id != user_id:
+            await message.reply_text("Remote sessions only work in a private chat with the bot.")
+            return
+        try:
+            minutes = int(args[1]) if len(args) == 2 else config.remote_default_minutes
+        except ValueError:
+            minutes = -1
+        refusal = controller.check_request(user_id, chat_id, minutes)
+        if refusal is not None:
+            await message.reply_text(refusal)
+            return
+        summary = (f"FULL VIEW AND CONTROL for {minutes} minute(s): you will see this PC's screen, and your "
+                   "mouse and keyboard will control it until the time ends. A red banner stays on the PC; "
+                   "Ctrl+Alt+Shift+Q or its Stop button ends the session early.")
+        plan = Plan(summary=summary, steps=[Step(
+            "remote_start", {"minutes": str(minutes)},
+            description=f"Full view and mouse/keyboard control for {minutes} minute(s); stops automatically.",
+        )], planner="direct")
+        await propose_plan(update, context, plan)
+        return
+    await message.reply_text(REMOTE_USAGE)
+
+
 # ---------------------------------------------------------------------------
 # Errors and lifecycle
 # ---------------------------------------------------------------------------
@@ -1640,6 +1748,7 @@ async def _post_init(application: Application) -> None:
             BotCommand("screen", "approve a full-screen photo"),
             BotCommand("window", "approve a window photo"),
             BotCommand("watch", "start, adjust or stop visible screen sharing"),
+            BotCommand("remote", "private remote desktop (needs approval)"),
         ])
     except TelegramError as exc:
         audit.warning("Could not set bot commands", error=str(exc))
@@ -1688,6 +1797,12 @@ async def _post_shutdown(application: Application) -> None:
             await asyncio.wait_for(asyncio.shield(session.task), 5)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+    remote = application.bot_data.get("remote_controller")
+    if remote is not None and remote.active is not None:
+        try:
+            await asyncio.wait_for(remote.stop("shutdown"), 10)
+        except (asyncio.TimeoutError, Exception):
+            audit.warning("Remote session did not stop cleanly during shutdown")
     task = application.bot_data.get("scheduler_task")
     if task is not None:
         task.cancel()
@@ -1734,6 +1849,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("screen", cmd_screen))
     application.add_handler(CommandHandler("window", cmd_window))
     application.add_handler(CommandHandler("watch", cmd_watch))
+    application.add_handler(CommandHandler("remote", cmd_remote))
     application.add_handler(CommandHandler(["yes", "approve"], cmd_yes))
     application.add_handler(CommandHandler(["no", "deny"], cmd_no))
     application.add_handler(CallbackQueryHandler(on_button, pattern=r"^(apv|deny):"))

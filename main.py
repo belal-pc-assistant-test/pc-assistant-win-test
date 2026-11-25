@@ -314,6 +314,22 @@ def self_check(config: Config) -> int:
         _fail("Pillow missing", "pip install Pillow")
         problems += 1
 
+    # 9) Remote desktop (optional; never a reason to fail the check)
+    print("\n[9] Remote desktop (/remote, optional)")
+    if os.name == "nt":
+        _ok("remote control", "available on this Windows PC (approval required for each session)")
+    else:
+        _warn("remote control", "Windows only; it is refused on this system")
+    if (config.tools_dir / "cloudflared.exe").is_file():
+        _ok("cloudflared", "present in the tools folder")
+    else:
+        _warn("cloudflared", "not downloaded yet; it is fetched from the official GitHub release on the first /remote start")
+    if shutil.which("ssh"):
+        _ok("ssh (fallback tunnel)", "found")
+    else:
+        _warn("ssh (fallback tunnel)", "not found; Cloudflare remains the only tunnel option")
+    _ok("remote limits", f"default {config.remote_default_minutes} min, max {config.remote_max_minutes} min")
+
     print("\n=== Result ===")
     if problems:
         print(f"{problems} problem(s) found — fix the [FAIL] lines above.")

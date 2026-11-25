@@ -107,6 +107,13 @@ PARAM_SPEC: dict[str, dict[str, list[str]]] = {
     "power": {"required": ["mode"], "optional": ["delay"]},
 }
 
+#: Actions that only the bot can create (approval buttons, /remote). The planners
+#: cannot emit them because they are not in VALID_ACTIONS, and the generic executor
+#: refuses them, so a remote session can only start from the approved /remote flow.
+BOT_ONLY_ACTIONS: dict[str, str] = {
+    "remote_start": RISK_HIGH,
+}
+
 #: Highest risk an action can have. Shown next to every step.
 ACTION_RISK: dict[str, str] = {
     "reply": RISK_LOW,
@@ -172,6 +179,7 @@ ACTION_TITLES: dict[str, str] = {
     "powershell": "PowerShell command",
     "kill_process": "Kill process",
     "power": "Power off / restart / sleep",
+    "remote_start": "Start remote desktop (view + control)",
 }
 
 ACTION_ICONS: dict[str, str] = {
@@ -199,6 +207,7 @@ ACTION_ICONS: dict[str, str] = {
     "powershell": "🖥️",
     "kill_process": "☠️",
     "power": "⏻",
+    "remote_start": "🖥️",
 }
 
 #: Longest accepted value per param (characters). Default 1000.
@@ -221,6 +230,8 @@ PARAM_MAX_LEN: dict[str, int] = {
 
 
 def risk_of(action: str) -> str:
+    if action in BOT_ONLY_ACTIONS:
+        return BOT_ONLY_ACTIONS[action]
     return ACTION_RISK.get(action, RISK_HIGH)
 
 

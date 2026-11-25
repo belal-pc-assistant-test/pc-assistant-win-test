@@ -17,6 +17,7 @@ def build_zip(root: Path, output: Path) -> None:
     sources = [root / name for name in TOP_LEVEL]
     sources += sorted((root / "assistant").rglob("*.py"))
     sources += sorted((root / "tests").glob("test_*.py"))
+    sources += sorted((root / "tests").glob("_*.py"))  # shared test helpers (no secrets)
     # Guard against accidentally pasting the current local bot token into a
     # source file. Never print the token, even if packaging is refused.
     secrets = []
@@ -45,7 +46,8 @@ def build_zip(root: Path, output: Path) -> None:
             relative = source.relative_to(root)
             if any(part.casefold() in EXCLUDED_NAMES for part in relative.parts):
                 continue
-            if any(part in {"__pycache__", ".venv", "data", "models", "logs", "downloads", "screenshots"} for part in relative.parts):
+            if any(part in {"__pycache__", ".venv", "data", "models", "logs", "downloads", "screenshots", "tools"}
+                   for part in relative.parts):
                 continue
             # Do not follow links into private data outside the release tree.
             if source.is_symlink() or not source.resolve().is_relative_to(root):
