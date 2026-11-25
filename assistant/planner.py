@@ -768,7 +768,7 @@ def is_placeholder_value(value: str) -> bool:
     return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
 
 
-WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|\\\\\\)")
+WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|" + re.escape("\\\\") + ")")  # drive, or two-backslash UNC
 
 
 def _resolve_light(raw: str, workspace_root: Path) -> Path:
@@ -780,6 +780,23 @@ def _resolve_light(raw: str, workspace_root: Path) -> Path:
     if not path.is_absolute() and not WINDOWS_PATH_RE.match(cleaned):
         path = workspace_root / path
     return path
+
+
+def _is_network_or_device_text(text: str) -> bool:
+    """Same test on the text the model produced, before any join with the workspace."""
+    normalized = (text or "").strip().strip('"').strip("'").replace("/", "\\")
+    return normalized.startswith("\\\\") or normalized.startswith("\\??\\")
+
+
+def _is_network_or_device(path: Path) -> bool:
+    """UNC (\\\\server\\share), \\\\?\\ and \\\\.\\ device, and \\??\\ NT paths.
+
+    On Windows, even an existence check on these can contact a remote host and
+    send credentials, so the planner must not probe them. The executor refuses
+    them anyway (see ``base.check_path_syntax``).
+    """
+    text = str(path).replace("/", "\\")
+    return text.startswith("\\\\") or text.startswith("\\??\\")
 
 
 def sanitize_and_annotate(
@@ -814,6 +831,12 @@ def sanitize_and_annotate(
 
         if path_value:
             resolved = _resolve_light(path_value, workspace_root)
+            if _is_network_or_device_text(path_value) or _is_network_or_device(resolved):
+                # Keep the step so the executor refuses it with a clear message, but
+                # never probe the path here.
+                step.warning = "⚠️ network and device paths are refused."
+                kept.append(step)
+                continue
             exists = resolved.exists()
             if step.action in EXISTING_PATH_ACTIONS and not exists:
                 step.warning = f"⚠️ does not exist on this PC: {resolved}"

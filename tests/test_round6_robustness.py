@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import stat
 import tempfile
 import unittest
 from logging.handlers import RotatingFileHandler
@@ -113,7 +115,9 @@ class LoneSurrogateTests(unittest.TestCase):
 
     def test_lone_surrogate_in_plan_text_is_a_validation_error(self):
         from assistant.plan_code import fingerprint
-        root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         raw = '{"summary":"s","steps":[{"action":"reply","params":{"text":"hi \\ud800 there"}}]}'
         with self.assertRaises(PlanValidationError):
             build_plan(raw, "cloud", "m", 6, root)
@@ -161,7 +165,9 @@ class DeepNestingTests(unittest.TestCase):
 class NulPathTests(unittest.TestCase):
 
     def test_nul_in_planned_paths_does_not_raise_and_is_refused_by_executor(self):
-        root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         steps = [
             Step("read_file", {"path": "notes\x00.txt"}),
             Step("write_file", {"path": "C:\\a\x00b.txt", "content": "x"}),
@@ -171,6 +177,45 @@ class NulPathTests(unittest.TestCase):
         self.assertEqual(len(annotated), 3)
         with self.assertRaises(ActionError):
             base.check_path_syntax("notes\x00.txt")
+
+
+class PlannerNetworkProbeTests(unittest.TestCase):
+    """The planner must not call exists() on UNC or device paths (Windows may send NTLM)."""
+
+    def test_network_and_device_paths_are_never_probed(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        probed: list[str] = []
+        real_exists = Path.exists
+
+        def spy(path_obj, *args, **kwargs):
+            probed.append(str(path_obj))
+            return real_exists(path_obj, *args, **kwargs)
+
+        steps = [
+            Step("read_file", {"path": r"\\evil.example\share\x.txt"}),          # UNC
+            Step("write_file", {"path": "//evil.example/share/y.txt", "content": "x"}),
+            Step("list_dir", {"path": r"\\?\UNC\evil.example\share"}),           # device
+            Step("read_file", {"path": r"\??\UNC\evil.example\share\z.txt"}),    # NT path
+        ]
+        with mock.patch.object(Path, "exists", spy):
+            kept, _notes = sanitize_and_annotate(steps, root)
+        for text in probed:
+            self.assertNotIn("evil.example", text, "a network path was probed")
+        self.assertEqual(len(kept), 4, "the executor still sees the step and refuses it")
+        for step in kept:
+            self.assertIn("network and device paths", step.warning)
+
+    def test_ordinary_paths_are_still_checked(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "present.txt").write_text("x", encoding="utf-8")
+        kept, _ = sanitize_and_annotate([Step("read_file", {"path": "present.txt"}),
+                                         Step("read_file", {"path": "missing.txt"})], root)
+        self.assertEqual(kept[0].warning, "")
+        self.assertIn("does not exist", kept[1].warning)
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +270,14 @@ class StartupRetryTests(unittest.TestCase):
                     .base_url("http://127.0.0.1:9/bot").build())
 
         sleeps: list[float] = []
-        with self.assertRaises(NetworkError):
-            main.run_polling_with_retries(make, attempts=2, sleep=sleeps.append)
+        with mock.patch.dict(os.environ):
+            # A proxy in the environment must not change what this test checks:
+            # the refused connection to 127.0.0.1:9.
+            for key in [k for k in os.environ if "proxy" in k.lower()]:
+                del os.environ[key]
+            os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+            with self.assertRaises(NetworkError):
+                main.run_polling_with_retries(make, attempts=2, sleep=sleeps.append)
         self.assertEqual(sleeps, [2])
 
 
@@ -241,7 +292,9 @@ class PlannerChainTests(unittest.TestCase):
             def plan(self, request, root, max_steps=6):
                 raise RecursionError("deep")
 
-        root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         planner = Planner(mode="cloud", cloud=Broken(), workspace_root=root)
         plan = planner.plan("take a screenshot")
         self.assertIsInstance(plan, Plan)
@@ -493,7 +546,9 @@ class TelegramDropTests(unittest.TestCase):
 class CrashedActionTests(unittest.TestCase):
 
     def test_a_crashing_handler_is_reported_and_does_not_raise(self):
-        tmp = Path(tempfile.mkdtemp())
+        tmp_obj = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_obj.cleanup)
+        tmp = Path(tmp_obj.name)
         _quiet_audit(tmp)
         try:
             config = make_config(tmp)
@@ -512,12 +567,16 @@ class CrashedActionTests(unittest.TestCase):
 class LogRotationTests(unittest.TestCase):
 
     def test_log_rotates_and_keeps_only_the_configured_backups(self):
-        tmp = Path(tempfile.mkdtemp())
+        tmp_obj = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_obj.cleanup)
+        tmp = Path(tmp_obj.name)
         log = tmp / "a.log"
         audit.setup(log, "INFO")
         try:
+            # Pick the handler that writes to this test's file, not any other handler.
             handler = next(h for h in logging.getLogger("assistant").handlers
-                           if isinstance(h, RotatingFileHandler))
+                           if isinstance(h, RotatingFileHandler)
+                           and os.path.abspath(h.baseFilename) == os.path.abspath(str(log)))
             self.assertEqual(handler.backupCount, 5)
             handler.maxBytes = 4_000          # small, so the test rotates quickly
             for index in range(600):
@@ -594,12 +653,16 @@ class QuickRequestsAndRestartTests(unittest.TestCase):
 
 class PlatformStubTests(unittest.TestCase):
 
-    def test_lock_down_on_posix_uses_chmod_and_reports_it(self):
-        tmp = Path(tempfile.mkdtemp())
-        target = tmp / "t.json"
+    def test_lock_down_posix_branch_reports_chmod600(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = Path(tmp.name) / "t.json"
         target.write_text("{}", encoding="utf-8")
+        # The method name is checked everywhere. On Windows chmod can only toggle the
+        # read-only flag, so the permission bits are checked on POSIX only.
         self.assertEqual(token_store._lock_down(target, is_windows=False), "chmod600")
-        self.assertEqual(oct(target.stat().st_mode & 0o777), oct(0o600))
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":
