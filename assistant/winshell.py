@@ -18,7 +18,7 @@ import base64
 import html
 import os
 import re
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from . import audit
 
@@ -30,8 +30,9 @@ DEFAULT_REASON_LIMIT = 200
 _CLIXML_START = "#< CLIXML"
 _ERROR_STREAM = re.compile(r'<S S="Error">(.*?)</S>', re.S)
 _XML_CHAR = re.compile(r"_x([0-9A-Fa-f]{4})_")
-_WINDOWS_PATH = re.compile(r"\b[A-Za-z]:\\[^\s\"'<>|]*|\\\\[^\s\"'<>|]+")
-_POSIX_PATH = re.compile(r"(?<![\w.])/[\w.\-]+(?:/[^\s\"'<>|]*)?")
+# A path runs to the end of its line, so a folder name with spaces cannot leave a tail behind.
+_WINDOWS_PATH = re.compile(r"\b[A-Za-z]:\\[^\r\n]*|\\\\[^\r\n]+")
+_POSIX_PATH = re.compile(r"(?<![\w.])/[\w.\-]+(?:/[^\r\n]*)?")
 _TOKEN_SHAPE = re.compile(r"\b\d{6,}:[A-Za-z0-9_\-]{20,}\b")
 
 
@@ -76,20 +77,39 @@ def clixml_to_text(raw: object) -> str:
     return text
 
 
-def sanitize_failure(raw: object, limit: int = DEFAULT_REASON_LIMIT) -> str:
+def sanitize_failure(raw: object, limit: int = DEFAULT_REASON_LIMIT,
+                     keep: Iterable[str] = ()) -> str:
     """A short, safe reason from PowerShell stderr.
 
     * CLIXML progress noise is dropped; only the error stream text is kept.
-    * Registered secrets, token-shaped strings, Windows paths and POSIX paths are replaced.
+    * Registered secrets, token-shaped strings, Windows paths and POSIX paths are replaced
+      with ``<path>``. The one exception is a value in ``keep``: text the user typed
+      (for example the file they asked to open), which is shown as typed, unless it
+      contains a secret or token, which is always redacted.
     * The result is one line of at most ``limit`` characters, and never empty.
     """
     text = clixml_to_text(raw)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    text = " ".join(lines[:3])
-    text = audit.redact_secret(text)
-    text = _TOKEN_SHAPE.sub("[REDACTED]", text)
-    text = _WINDOWS_PATH.sub("<path>", text)
-    text = _POSIX_PATH.sub("<path>", text)
+    kept: list[str] = []
+    for value in keep:
+        value = str(value or "")
+        if value and value in text:
+            # Mask the user's value so the path rules below cannot touch it.
+            text = text.replace(value, f"\ue000{len(kept)}\ue001")
+            kept.append(_TOKEN_SHAPE.sub("[REDACTED]", audit.redact_secret(value)))
+    lines: list[str] = []
+    for line in text.splitlines():
+        line = audit.redact_secret(line.strip())
+        if not line:
+            continue
+        line = _TOKEN_SHAPE.sub("[REDACTED]", line)
+        line = _WINDOWS_PATH.sub("<path>", line)
+        line = _POSIX_PATH.sub("<path>", line)
+        lines.append(line)
+        if len(lines) == 3:
+            break
+    text = " ".join(lines)
+    for index, value in enumerate(kept):
+        text = text.replace(f"\ue000{index}\ue001", value)
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         text = "PowerShell gave no details"

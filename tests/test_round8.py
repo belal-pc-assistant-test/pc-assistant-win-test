@@ -22,6 +22,8 @@ from test_flow import (  # noqa: E402  (shared fakes; also sets a private token 
     make_config, make_context, make_update,
 )
 
+from _hermetic import IsolatedCase, ModuleGuard  # noqa: E402
+
 from telegram.ext import ApplicationHandlerStop  # noqa: E402
 
 from assistant import bot as botmod  # noqa: E402
@@ -35,6 +37,24 @@ import main as main_mod  # noqa: E402
 SECRET_TEXT = "TOP-SECRET-CONTENT-123"
 
 
+# No test in this module may start a real process or open a network connection (tests/_hermetic.py).
+# main() also changes process-wide state on Windows (console code page, DPI awareness, root logging),
+# so those are no-ops here.
+_guard = ModuleGuard(extra=[
+    (main_mod, "ensure_utf8_console", lambda: None),
+    (main_mod, "enable_dpi_awareness", lambda: None),
+    (botmod.audit, "install_root_redaction", lambda *_a, **_k: None),
+])
+
+
+def setUpModule():
+    _guard.start()
+
+
+def tearDownModule():
+    _guard.stop()
+
+
 def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
     try:
         os.symlink(target, link, target_is_directory=directory)
@@ -42,8 +62,9 @@ def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
         raise unittest.SkipTest(f"symlinks are not available here: {exc}")
 
 
-class _Tmp(unittest.TestCase):
+class _Tmp(IsolatedCase):
     def setUp(self) -> None:
+        super().setUp()
         self.tmpdir = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmpdir.name)
         self.config = make_config(self.dir)
@@ -201,7 +222,7 @@ class OnDocumentSizeTests(_Tmp):
 # D5: /pause and /resume
 # ---------------------------------------------------------------------------
 
-class PauseFileTests(unittest.TestCase):
+class PauseFileTests(IsolatedCase):
 
     def test_file_sits_beside_the_jobs_file(self):
         self.assertEqual(pause.pause_path(Path("/x/data/jobs.json")), Path("/x/data/pause.json"))
@@ -507,7 +528,7 @@ class PausedBriefingTests(_Tmp):
 # D6: refuse to run as Administrator
 # ---------------------------------------------------------------------------
 
-class ElevationCheckTests(unittest.TestCase):
+class ElevationCheckTests(IsolatedCase):
 
     def test_not_windows_is_never_elevated(self):
         self.assertFalse(elevation.is_administrator(is_windows=False, check=lambda: True))
@@ -568,7 +589,10 @@ class ElevatedStartTests(_Tmp):
         self.assertEqual(code, 0)
 
     def test_self_check_reports_elevation_as_a_problem(self):
+        # No planner endpoint: self_check would otherwise try the configured cloud URL.
+        no_planner = SimpleNamespace(status=lambda: {})
         with mock.patch.object(elevation, "is_administrator", return_value=True), \
+                mock.patch.object(main_mod, "build_planner", return_value=no_planner), \
                 mock.patch.object(main_mod.token_store, "validate_token",
                                   return_value=(True, "stubbed", None)):
             out = io.StringIO()
@@ -593,7 +617,7 @@ class ElevatedStartTests(_Tmp):
 # Windows ACL command shape (runs on Linux: the subprocess is stubbed)
 # ---------------------------------------------------------------------------
 
-class AclCommandShapeTests(unittest.TestCase):
+class AclCommandShapeTests(IsolatedCase):
 
     SID = "S-1-5-21-111-222-333-1001"
 
@@ -639,7 +663,7 @@ class AclCommandShapeTests(unittest.TestCase):
                                                           Path("x"), self.SID, directory=False))
 
 
-class AclOwnerOnlyPredicateTests(unittest.TestCase):
+class AclOwnerOnlyPredicateTests(IsolatedCase):
     """The read-back decision: only the owner, as the one explicit entry. Closes mutation M8."""
 
     SID = "S-1-5-21-1-2-3-1001"

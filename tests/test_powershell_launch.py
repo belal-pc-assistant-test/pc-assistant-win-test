@@ -8,15 +8,29 @@ environment. They run on Linux. The real-Windows reproduction is in test_windows
 from __future__ import annotations
 
 import os
+import socket
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from _hermetic import VIOLATIONS, ForbiddenCall, IsolatedCase, ModuleGuard  # noqa: E402
 from assistant import audit, token_store, winshell  # noqa: E402
 from assistant.actions import base, system  # noqa: E402
 from assistant.actions.base import ActionError  # noqa: E402
+
+# Any real process or network call in this module fails the test (see tests/_hermetic.py).
+_guard = ModuleGuard()
+
+
+def setUpModule():
+    _guard.start()
+
+
+def tearDownModule():
+    _guard.stop()
 
 PS7_MODULE_PATH = r"C:\Program Files\PowerShell\7\Modules;C:\Program Files\WindowsPowerShell\Modules"
 SID = "S-1-5-21-111-222-333-1001"
@@ -37,7 +51,7 @@ def _proc(returncode=0, stdout=b"", stderr=b""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-class PowerShellPathTests(unittest.TestCase):
+class PowerShellPathTests(IsolatedCase):
 
     def test_full_path_under_systemroot_when_the_file_exists(self):
         with tempfile.TemporaryDirectory() as root:
@@ -59,7 +73,7 @@ class PowerShellPathTests(unittest.TestCase):
             self.assertEqual(winshell.windows_powershell_path({"WINDIR": root}), str(exe))
 
 
-class ChildEnvironmentTests(unittest.TestCase):
+class ChildEnvironmentTests(IsolatedCase):
 
     def test_powershell7_module_settings_are_removed_in_any_case(self):
         source = {
@@ -76,9 +90,10 @@ class ChildEnvironmentTests(unittest.TestCase):
             self.assertEqual(os.environ["PSModulePath"], PS7_MODULE_PATH)
 
 
-class DecodeAndSanitizeTests(unittest.TestCase):
+class DecodeAndSanitizeTests(IsolatedCase):
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
@@ -126,14 +141,40 @@ class DecodeAndSanitizeTests(unittest.TestCase):
                          "<AV>Preparing modules</AV></PR></MS></Obj></Objs>")
         self.assertEqual(winshell.sanitize_failure(progress_only), "PowerShell gave no details")
 
+    def test_user_typed_path_is_shown_as_typed_and_other_paths_are_not(self):
+        typed = "C:\\Users\\me\\My Docs\\report.pdf"
+        error = f"Cannot find {typed} because C:\\Users\\RUNNER~1\\AppData\\x.txt is locked"
+        reason = winshell.sanitize_failure(error, keep=[typed])
+        self.assertIn(typed, reason)
+        self.assertNotIn("RUNNER", reason)
+        self.assertNotIn("AppData", reason)
+
+    def test_a_folder_name_with_spaces_leaves_no_tail_behind(self):
+        reason = winshell.sanitize_failure("denied: C:\\Users\\me\\My Docs\\a.txt")
+        self.assertIn("<path>", reason)
+        self.assertNotIn("Docs", reason)
+        self.assertNotIn("a.txt", reason)
+
+    def test_a_token_inside_the_kept_value_is_still_redacted(self):
+        typed = f"C:\\Users\\me\\{FAKE_TOKEN}\\doc.txt"
+        reason = winshell.sanitize_failure(f"missing {typed}", keep=[typed])
+        self.assertNotIn(FAKE_TOKEN, reason)
+        self.assertIn("[REDACTED]", reason)
+
+    def test_the_kept_value_counts_toward_the_limit(self):
+        typed = "C:\\" + "folder\\" * 40 + "file.txt"
+        reason = winshell.sanitize_failure(f"missing {typed}", limit=60, keep=[typed])
+        self.assertLessEqual(len(reason), 60)
+
     def test_ordinary_words_with_slashes_survive(self):
         self.assertEqual(winshell.sanitize_failure("use and/or wisely"), "use and/or wisely")
 
 
-class TokenStoreLaunchTests(unittest.TestCase):
+class TokenStoreLaunchTests(IsolatedCase):
     """token_store's PowerShell calls, with subprocess.run stubbed."""
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
@@ -233,10 +274,11 @@ class TokenStoreLaunchTests(unittest.TestCase):
         self.assertFalse(target.exists(), "the plain-text token must not be left behind")
 
 
-class ActionLaunchTests(unittest.TestCase):
+class ActionLaunchTests(IsolatedCase):
     """The actions' PowerShell (base.run_powershell) with Windows behaviour forced on."""
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
@@ -287,10 +329,11 @@ class ActionLaunchTests(unittest.TestCase):
         self.assertNotIn("CLIXML", message)
 
 
-class CoreActionOutputTests(unittest.TestCase):
+class CoreActionOutputTests(IsolatedCase):
     """core.powershell shows the command's own output; core.open_target shows a sanitized failure."""
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
@@ -317,7 +360,7 @@ class CoreActionOutputTests(unittest.TestCase):
 
     def test_open_fallback_failure_is_sanitized(self):
         from assistant.actions import core
-        proc = _proc(1, stderr=(CLIXML_ERROR + " C:\\Secret\\file.txt").encode("utf-8"))
+        proc = SimpleNamespace(returncode=1, stdout="", stderr=CLIXML_ERROR + " C:\\Secret\\file.txt")
         target = Path(self.tmp.name) / "doc.txt"
         target.write_text("x", encoding="utf-8")
         with mock.patch.object(core, "IS_WINDOWS", True), \
@@ -326,11 +369,81 @@ class CoreActionOutputTests(unittest.TestCase):
             with self.assertRaises(ActionError) as caught:
                 core.open_target({"target": str(target)}, self._ctx())
         message = str(caught.exception)
-        self.assertIn("could not be loaded", message)
-        self.assertNotIn("C:\\", message)
+        # The file the user asked for is shown as typed (the rule in winshell.sanitize_failure).
+        prefix = f"Could not open '{target}': "
+        self.assertTrue(message.startswith(prefix), message)
+        # PowerShell's own text is cut to a short reason, and nothing from it leaks.
+        reason = message[len(prefix):]
+        self.assertTrue(reason, "a reason is required")
+        self.assertLessEqual(len(reason), 120)
         self.assertNotIn("Secret", message)
+        self.assertNotIn("runneradmin", message)
         self.assertNotIn("CLIXML", message)
+        self.assertNotIn("Preparing modules", message)
 
+    def test_open_fallback_starts_windows_powershell_through_the_clean_launcher(self):
+        """Only Popen is stubbed here. run_powershell and the launcher run for real."""
+        from assistant.actions import core
+        seen: dict = {}
+        exe = str(Path(self.tmp.name) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+
+        class FakeProcess:
+            returncode = 1
+
+            def __init__(self, argv, **kwargs):
+                seen["argv"] = list(argv)
+                seen["env"] = kwargs.get("env")
+
+            def communicate(self, timeout=None):
+                return ("", CLIXML_ERROR)
+
+        target = Path(self.tmp.name) / "doc.txt"
+        target.write_text("x", encoding="utf-8")
+        with mock.patch.object(core, "IS_WINDOWS", True), mock.patch.object(base, "IS_WINDOWS", True), \
+                mock.patch.object(core, "_open_external", side_effect=OSError("no shell")), \
+                mock.patch.object(base.winshell, "windows_powershell_path", return_value=exe), \
+                mock.patch.object(base.subprocess, "Popen", FakeProcess), \
+                mock.patch.dict(os.environ, {"PSModulePath": PS7_MODULE_PATH}):
+            with self.assertRaises(ActionError):
+                core.open_target({"target": str(target)}, self._ctx())
+        self.assertEqual(seen["argv"][0], exe)
+        self.assertEqual(seen["argv"][1:4], ["-NoProfile", "-NonInteractive", "-Command"])
+        self.assertIn("Start-Process", seen["argv"][4])
+        self.assertIsNotNone(seen["env"], "the fallback must pass a child environment")
+        self.assertNotIn("PSModulePath", seen["env"])
+
+
+class GuardSelfTests(IsolatedCase):
+    """The guard itself: a real process or connection must fail the test, not run."""
+
+    def expect_refused(self, call):
+        """The refusal is what these tests check, so it is removed from the violation record."""
+        before = len(VIOLATIONS)
+        with self.assertRaises(ForbiddenCall):
+            call()
+        del VIOLATIONS[before:]
+
+    def test_a_real_process_is_refused(self):
+        self.expect_refused(lambda: subprocess.run(["tpa-not-a-real-program"], check=False))
+
+    def test_a_real_connection_is_refused(self):
+        self.expect_refused(lambda: socket.create_connection(("127.0.0.1", 9)))
+
+    def test_isolated_case_undoes_secrets_and_the_powershell_reason_after_each_test(self):
+        probe = IsolatedCase("setUp")  # an instance that runs only the reset machinery
+        probe.setUp()
+        audit.register_secret("probe-secret-value-for-the-reset-test")
+        token_store._last_powershell_error = "left behind by a test"
+        base._ABORT.set()
+        probe.doCleanups()
+        self.assertNotIn("probe-secret-value-for-the-reset-test", audit.registered_secrets())
+        self.assertEqual(token_store._last_powershell_error, "")
+        self.assertFalse(base.abort_requested())
+
+    def test_a_stub_inside_a_test_takes_precedence_and_then_the_guard_returns(self):
+        with mock.patch.object(subprocess, "run", return_value="stub"):
+            self.assertEqual(subprocess.run(["x"]), "stub")
+        self.expect_refused(lambda: subprocess.run(["x"]))
 
 if __name__ == "__main__":
     unittest.main()

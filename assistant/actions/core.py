@@ -134,7 +134,10 @@ def open_target(params: dict[str, str], ctx: ActionContext) -> ActionResult:
                 min(config.command_timeout, 30), config.workspace_root,
             )
             if proc.returncode != 0:
-                raise ActionError(f"Could not open '{target}': {sanitize_failure(proc.stderr, 200)}")
+                # The file the user asked for is shown as typed; any other path in PowerShell's
+                # error text is replaced, and the reason is kept short.
+                reason = sanitize_failure(proc.stderr, 120, keep=(target,))
+                raise ActionError(f"Could not open '{target}': {reason}")
         else:
             raise ActionError(
                 f"Could not open '{target}': {exc}. Is a desktop session available?"
