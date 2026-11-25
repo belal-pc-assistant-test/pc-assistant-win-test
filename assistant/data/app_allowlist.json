@@ -1,0 +1,16 @@
+{
+  "_comment": "Apps that /install and /uninstall may handle through winget. Each id must be a winget package id (use --exact --source winget). Add your own apps in config.ini under [apps] extra_allowed_apps, not here.",
+  "apps": {
+    "7zip": {"id": "7zip.7zip", "title": "7-Zip"},
+    "vlc": {"id": "VideoLAN.VLC", "title": "VLC media player"},
+    "notepadpp": {"id": "Notepad++.Notepad++", "title": "Notepad++"},
+    "git": {"id": "Git.Git", "title": "Git"},
+    "python": {"id": "Python.Python.3.13", "title": "Python 3.13"},
+    "chrome": {"id": "Google.Chrome", "title": "Google Chrome"},
+    "firefox": {"id": "Mozilla.Firefox", "title": "Mozilla Firefox"},
+    "vscode": {"id": "Microsoft.VisualStudioCode", "title": "Visual Studio Code"},
+    "zoom": {"id": "Zoom.Zoom", "title": "Zoom Workplace"},
+    "whatsapp": {"id": "WhatsApp.WhatsApp", "title": "WhatsApp Desktop"},
+    "telegram": {"id": "Telegram.TelegramDesktop", "title": "Telegram Desktop"}
+  }
+}
