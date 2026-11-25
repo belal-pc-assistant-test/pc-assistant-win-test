@@ -15,7 +15,7 @@ if errorlevel 1 goto nopython
 for /f "tokens=2" %%v in ('python --version 2^>^&1') do set "PYVER=%%v"
 echo [1/6] Found Python %PYVER%
 
-python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
 if errorlevel 1 goto oldpython
 
 if exist ".venv\Scripts\python.exe" (
@@ -97,13 +97,13 @@ exit /b 0
 :nopython
 echo.
 echo [X] Python was not found on PATH.
-echo     Install Python 3.10 or newer from https://www.python.org/downloads/windows/
+echo     Install Python 3.11 or newer from https://www.python.org/downloads/windows/
 echo     IMPORTANT: tick "Add python.exe to PATH" in the installer.
 goto end
 
 :oldpython
 echo.
-echo [X] Python 3.10 or newer is required. Please update Python.
+echo [X] Python 3.11 or newer is required. Please update Python.
 goto end
 
 :venvfail

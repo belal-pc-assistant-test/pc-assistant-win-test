@@ -12,8 +12,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ..config import Config
+from ..config import Config, normalize_path
 from .base import (
+    SCRIPT_EXTENSIONS,
+    URI_SCHEME_RE,
+    WINDOWS_DRIVE_RE,
+    check_path_syntax,
+    ensure_not_protected,
+    ps_literal,
     IS_WINDOWS,
     ActionContext,
     ActionError,
@@ -95,9 +101,22 @@ def open_target(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     path_to_open: str | None = None
 
     if not is_url:
+        # Only plain drive/relative paths or named applications. Other URI
+        # schemes (ms-msdt:, file:, search-ms:...) can launch tools directly.
+        if URI_SCHEME_RE.match(expanded) and not WINDOWS_DRIVE_RE.match(expanded):
+            raise ActionError(f"Refused: '{target}' uses a URI scheme this action does not open.")
+        check_path_syntax(expanded, "Target")
+        # Windows runs the associated program for these, whatever the folder.
+        if Path(expanded).suffix.lower() in SCRIPT_EXTENSIONS:
+            raise ActionError(
+                f"Refused: '{Path(expanded).name}' is a script or shortcut; the open action "
+                "does not run those. Use a reviewed powershell step instead."
+            )
         candidate = Path(expanded)
         if not candidate.is_absolute() and (os.sep in expanded or "/" in expanded):
             candidate = config.workspace_root / candidate
+        # Protected names are refused even as bare names; check the real target.
+        ensure_not_protected(normalize_path(candidate), "Target")
         if candidate.exists():
             path_to_open = str(candidate)
 
@@ -108,9 +127,8 @@ def open_target(params: dict[str, str], ctx: ActionContext) -> ActionResult:
         if IS_WINDOWS:
             # Avoid interpolating a target into cmd.exe: shell metacharacters
             # could otherwise turn a simple open into an arbitrary command.
-            quoted = expanded.replace("'", "''")
             proc = run_powershell(
-                f"Start-Process -FilePath '{quoted}' -ErrorAction Stop",
+                f"Start-Process -FilePath {ps_literal(expanded)} -ErrorAction Stop",
                 min(config.command_timeout, 30), config.workspace_root,
             )
             if proc.returncode != 0:
@@ -233,7 +251,7 @@ def read_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
 def write_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     config = ctx.config
     started = time.perf_counter()
-    target = resolve_path(params.get("path", ""), config, "File path")
+    target = resolve_path(params.get("path", ""), config, "File path", for_write=True)
     existed = target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     data = "" if params.get("content") is None else str(params.get("content"))

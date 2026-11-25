@@ -68,6 +68,28 @@ def setup(log_file: Path, level: str = "INFO") -> None:
     _configured = True
 
 
+def install_root_redaction(stream=None, level: int = logging.WARNING) -> logging.Handler:
+    """Route root-logger output (library warnings) through the same redaction.
+
+    Without a handler on the root logger, Python falls back to printing
+    WARNING+ records unredacted on stderr. Installing this handler makes every
+    such message pass through :func:`redact_secret`. Idempotent.
+    """
+    root = logging.getLogger()
+    for existing in root.handlers:
+        if getattr(existing, "_tpa_redacting", False):
+            return existing
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(level)
+    handler.setFormatter(SafeFormatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    handler._tpa_redacting = True  # type: ignore[attr-defined]
+    root.addHandler(handler)
+    return handler
+
+
 def close() -> None:
     """Flush and close every log handler and allow re-configuration later.
 

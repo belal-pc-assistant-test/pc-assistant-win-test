@@ -349,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         logger = logging.getLogger(logger_name)
         logger.addHandler(logging.NullHandler())
         logger.propagate = False
+    audit.install_root_redaction()  # library warnings also pass the token redaction
     ensure_utf8_console()
     enable_dpi_awareness()
 

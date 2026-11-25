@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shutil
@@ -12,11 +13,39 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol, runtime_checkable
 
+from .. import token_store
 from ..config import Config, normalize_path, path_is_inside
 
 IS_WINDOWS = os.name == "nt"
 
 WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|\\\\)")
+WINDOWS_DRIVE_RE = re.compile(r"^[a-zA-Z]:")
+
+#: Device names Windows resolves to devices no matter the folder or extension
+#: (``CON.txt`` is still the console). Writing to or reading them can hang or
+#: hit hardware, so they are refused everywhere.
+RESERVED_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(10)}
+    | {f"LPT{i}" for i in range(10)}
+)
+
+#: Files that hold credentials. File actions never read, send, list or
+#: overwrite these, even inside an allowed folder.
+PROTECTED_FILE_NAMES = frozenset({"token.json", "token.txt", ".env"})
+
+#: Autostart folder (normalised to backslashes, lower case); anything written
+#: here runs at the next sign-in.
+STARTUP_FOLDER_MARKER = "\\start menu\\programs\\startup"
+
+#: Explicit paths the open action refuses to launch (these run code directly).
+SCRIPT_EXTENSIONS = frozenset({
+    ".bat", ".cmd", ".com", ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
+    ".wsh", ".hta", ".reg", ".scr", ".msi", ".msp", ".lnk", ".url", ".chm", ".cpl",
+})
+
+#: URI schemes that are not plain web links (``ms-msdt:``, ``file:``, ``search-ms:``...).
+URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]+:")
 
 
 # ---------------------------------------------------------------------------
@@ -161,30 +190,98 @@ def ensure_inside(path: Path, roots: Iterable[Path], what: str = "Path") -> Path
     raise ActionError(f"{what} is outside the allowed folders ({pretty}): {normalized}")
 
 
-def resolve_path(raw: str, config: Config, what: str = "Path") -> Path:
-    """Turn user/model input into an absolute, allow-list-checked path."""
+def check_path_syntax(cleaned: str, what: str = "Path") -> None:
+    """Refuse path spellings that leave the local disk namespace.
+
+    * UNC and device paths (``\\\\server\\share``, ``\\\\?\\``, ``\\\\.\\``, ``//server``):
+      opening them can make Windows send NTLM credentials to a remote host.
+    * Alternate data streams (``file.txt:stream``): hidden content that
+      listings and size checks do not show.
+    * Reserved device names in any component (``CON``, ``NUL``, ``COM1``...).
+    """
+    if "\x00" in cleaned:
+        raise ActionError(f"{what} contains a NUL character.")
+    if cleaned.startswith(("\\\\", "//")):
+        raise ActionError(f"{what}: network (UNC) and device paths are not allowed.")
+    body = cleaned[2:] if WINDOWS_DRIVE_RE.match(cleaned) else cleaned
+    for part in re.split(r"[\\/]", body):
+        if not part:
+            continue
+        if ":" in part:
+            raise ActionError(f"{what}: alternate data streams (':') are not allowed.")
+        stem = part.split(".", 1)[0].rstrip(" ").upper()
+        if stem in RESERVED_DEVICE_NAMES:
+            raise ActionError(f"{what}: '{part}' is a reserved Windows device name.")
+
+
+def ensure_not_protected(path: Path, what: str = "Path", *, for_write: bool = False) -> None:
+    """Refuse credential files, the token store and (for writes) autostart folders.
+
+    ``path`` must already be normalized, so symlinks and junctions that point
+    at a protected file are caught by their real target.
+    """
+    if path.name.casefold() in PROTECTED_FILE_NAMES:
+        raise ActionError(f"{what} is a protected credential file and cannot be used.")
+    try:
+        store_dir = normalize_path(token_store.token_path().parent)
+    except Exception:  # no home folder: the name check still applies
+        store_dir = None
+    if store_dir is not None and path_is_inside(path, store_dir):
+        raise ActionError(f"{what} is inside the assistant's private token folder.")
+    if for_write:
+        lowered = str(path).lower().replace("/", "\\")
+        if STARTUP_FOLDER_MARKER in lowered:
+            raise ActionError(f"{what} is in the Windows Startup folder; writing there is refused.")
+
+
+def ps_literal(text: str) -> str:
+    """A PowerShell expression that yields ``text`` exactly.
+
+    Pasting text into a script is unsafe: PowerShell treats several Unicode
+    quote characters (U+2018, U+2019, U+201A, U+201B) as string delimiters, so
+    ASCII-only escaping can be broken out of. Base64 contains no quotes or
+    special characters, so the value stays inert whatever it contains.
+    """
+    encoded = base64.b64encode((text or "").encode("utf-8")).decode("ascii")
+    return ("([System.Text.Encoding]::UTF8.GetString("
+            f"[System.Convert]::FromBase64String('{encoded}')))")
+
+
+def resolve_path(raw: str, config: Config, what: str = "Path", *, for_write: bool = False) -> Path:
+    """Turn user/model input into an absolute, allow-list-checked path.
+
+    Syntax (UNC, device names, streams), credential files and autostart
+    folders are refused in every case. The allowed roots are enforced when
+    configured. Symlinks and junctions are resolved first, so the checks apply
+    to the real target.
+    """
     cleaned = expand(raw)
     if not cleaned:
         return config.workspace_root
+    check_path_syntax(cleaned, what)
     path = Path(cleaned)
     if not path.is_absolute() and not WINDOWS_PATH_RE.match(cleaned):
         path = config.workspace_root / path
     path = normalize_path(path)
     if config.allowed_roots:
         ensure_inside(path, config.allowed_roots, what)
+    ensure_not_protected(path, what, for_write=for_write)
     return path
 
 
-def resolve_in_roots(raw: str, config: Config, what: str = "Path") -> Path:
+def resolve_in_roots(raw: str, config: Config, what: str = "Path", *, for_write: bool = False) -> Path:
     """Like :func:`resolve_path`, but always confined to the effective roots."""
     cleaned = expand(raw)
     roots = effective_roots(config)
     if not cleaned:
         return roots[0]
+    check_path_syntax(cleaned, what)
     path = Path(cleaned)
     if not path.is_absolute() and not WINDOWS_PATH_RE.match(cleaned):
         path = roots[0] / path
-    return ensure_inside(path, roots, what)
+    resolved = ensure_inside(path, roots, what)
+    ensure_not_protected(resolved, what, for_write=for_write)
+    return resolved
 
 
 def sanitize_filename(name: str, fallback: str = "download.bin") -> str:
@@ -194,6 +291,9 @@ def sanitize_filename(name: str, fallback: str = "download.bin") -> str:
     raw = raw.strip(" .")
     if not raw or raw in {".", ".."}:
         return fallback
+    # "CON.txt", "nul" or "COM1.log" name devices on Windows; prefix them.
+    if raw.split(".", 1)[0].rstrip(" ").upper() in RESERVED_DEVICE_NAMES:
+        raw = "_" + raw
     return raw[:180]
 
 

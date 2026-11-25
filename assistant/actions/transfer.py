@@ -16,6 +16,7 @@ from .base import (
     ActionResult,
     effective_roots,
     ensure_inside,
+    ensure_not_protected,
     human_bytes,
     resolve_in_roots,
     sanitize_filename,
@@ -95,12 +96,14 @@ def receive_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
 
     roots = [normalize_path(p) for p in effective_roots(config)]
     if (params.get("target") or "").strip():
-        destination = resolve_in_roots(params["target"], config, "Destination")
+        destination = resolve_in_roots(params["target"], config, "Destination", for_write=True)
     else:
         folder = normalize_path(config.downloads_dir)
         ensure_inside(folder, roots, "Downloads folder")
         folder.mkdir(parents=True, exist_ok=True)
+        # Received names are sanitized (no separators, streams or device names).
         destination = unique_destination(folder, sanitize_filename(params.get("file_name", "")))
+        ensure_not_protected(destination, "Destination", for_write=True)
 
     if destination.exists():
         # A reviewed, explicit target must not silently become another path.

@@ -4,7 +4,7 @@ A Windows 10/11 program that turns Arabic or English Telegram requests into revi
 
 ## Quick setup
 
-Prerequisites: Windows 10/11, Python 3.10+ installed with **Add Python to PATH**, and a Telegram bot token from **@BotFather** (`/newbot`).
+Prerequisites: Windows 10/11, Python 3.11+ installed with **Add Python to PATH** (Pillow 13 requires 3.11), and a Telegram bot token from **@BotFather** (`/newbot`).
 
 1. **Unzip** the project into a folder on your PC.
 2. Put a UTF-8 plain-text file named **`token.txt`** in that folder, next to `install.bat`. Paste the bot token on its own line. The program uses the first non-empty line, removing surrounding whitespace and a UTF-8 BOM. Do not use `token.txt.txt`.
@@ -54,6 +54,35 @@ Both users can request actions, but only configured approvers can approve; with 
 
 `/panic` cancels pending plans, sets an abort flag, and attempts to kill tracked child processes; plans stop at their next check. It cannot undo completed actions, guarantee termination of process descendants, stop every GUI/system operation, reverse a shutdown already requested, or delete scheduled jobs. It pauses due jobs while the abort flag is set; approving a new plan clears the flag. Review `/jobs` and use `/canceltask CODE` to remove persisted jobs separately. Shutdown/restart have a minimum 30-second delay; request `power cancel` to attempt cancellation. Sleep and hibernate may be immediate.
 
+## Security model and limits
+
+This section lists what the code enforces and what it does not. The offline tests cover the enforcement logic. Windows-only parts (PowerShell, the clipboard, process control, DPAPI, capture, the banner's global hotkey, `cloudflared` runtime, and live Telegram) have **not** been run on Windows in the development sandbox; they were tested with fakes.
+
+**Enforced in code**
+
+* **Who can act.** Only the allowed Telegram user ID in a private chat can use the bot. Groups, channels, inline queries and edited messages are ignored. Voice notes, macros, scheduled jobs, reminders, briefings and text from forwarded messages cannot run anything without a plan you approve.
+* **Approvals.** Every plan needs your Yes or `approve CODE`. A code is bound to the exact steps (fingerprint), works once, and expires after 15 minutes. A replan voids the earlier code. A repeated or concurrent press runs the plan at most once. A stale button, a plan the store no longer holds, or an expired plan runs nothing. At most 50 plans can wait for approval.
+* **Planner output.** Local, Ollama and cloud output must match the schema and the action allowlist. The planner cannot create `remote_start`; the generic step executor refuses it too.
+* **Paths.** UNC and network paths (`\\server\share`, `//server`, `\\?\`, `\\.\`), reserved device names in any part of a path (`CON`, `NUL`, `COM1`, `LPT1`…), and alternate data streams (`file.txt:stream`) are refused. Symlinks and junctions are resolved before the check, so a link that leaves the allowed roots is refused.
+* **Received files.** Names are sanitized: no folders, no streams, and device names get a `_` prefix (`CON.exe` becomes `_CON.exe`). The file is written to a temporary name and renamed only after the size check. Uploads over `max_send_file_mb` are refused before download and deleted after it if they grew past the limit. The project does not extract archives, so there is no zip-bomb path.
+* **Credentials.** File actions never read, send, list or overwrite `token.json`, `token.txt`, `.env` or the token folder, even inside an allowed root or via a link. Writes into the Windows Startup folder are refused. The bot token is never placed in `config.ini`, plans, Telegram messages or logs. Every log handler, including library warnings, replaces the token and any other registered secret with `[REDACTED]`. Exception text is not logged, and the remote link is never logged or stored.
+* **Clipboard and process names.** Text sent to PowerShell (`clipboard_set`, `kill_process` by name, `open` fallback) travels as base64, so quotes, including Unicode quotes that PowerShell also treats as string delimiters, cannot change the script.
+* **Denial of service.** Each user may send 30 updates per 10 seconds; more are dropped. Requests over 2000 characters are refused before any planner sees them. Strangers are logged at most once a minute, without their message text. Logs rotate at 2 MB with 5 backups.
+* **Remote desktop.** Requests must carry a Host and, when present, an Origin that match the tunnel's public name or this machine's loopback name. Anything else gets 403 before the secret is checked. A tunnel that rewrites the Host header would be refused too, so the viewer would show 403 instead of working; the session then fails without exposing anything. Other remote limits are in the Remote desktop section.
+* **Persistence.** The bot creates no Windows service, scheduled task, registry Run key or Startup entry. Scheduled tasks and reminders live in the bot's own job file and run only while the bot is running, each occurrence needing approval.
+* **Dependencies.** `requirements.txt` pins exact versions of the four runtime packages. Optional voice packages are listed separately.
+
+**Not enforced: read these**
+
+* **Approved actions run with your Windows account's rights.** `powershell` (including `!`-prefixed commands), `open` of installed programs, and `write_file` are not sandboxed. The `allowed_roots` setting confines ordinary file actions only when you set it. When it is empty, `read_file`, `write_file`, `list_dir` and `send_file` (for non-protected files) can reach any folder your account can access. Approve only plans you have read, including their exact parameters.
+* **Protections are name-based.** A copy of a credential file under another name, or a secret typed into a message, is not detected. The fingerprint detects accidental change; it is not a signature.
+* **Telegram keeps what it receives.** Read, send and screenshot results, uploads, plans, and remote-session notices are stored by Telegram. The link message is protected from forwarding only inside the Telegram app.
+* **Token storage.** `token.txt` is plain text. The per-user store uses DPAPI on Windows when available; without it, the token is stored in plain text with owner-only permissions.
+* **`cloudflared` download.** The program downloads only from the official `github.com/cloudflare/cloudflared/releases/` path, follows only the GitHub asset redirect hosts, caps the size, and runs `cloudflared --version` before use. The default URL is `releases/latest`, so the version changes over time. Set `[remote] cloudflared_sha256` to a published SHA-256 to pin the exact binary; the check is off when that setting is empty.
+* **Cloud planner privacy (default `mode = cloud`).** After a separate confirmation, your request text and system context (local date and time, OS name and version, home folder path, working folder path) are sent to `text.pollinations.ai`. Planner requests ignore proxy environment settings and do not follow redirects. Only literal loopback Ollama addresses (`127.0.0.1`, `::1`) count as local.
+* **Remote desktop limits** are in the Remote desktop section: flaky free tunnels, UAC and secure-desktop windows out of reach, slower frame rates on weak PCs, and a link that must stay private.
+* **Windows-only features are unverified here.** See the note at the top of this section.
+
 ## Actions
 
 | Action | Effect / notes |
@@ -61,7 +90,7 @@ Both users can request actions, but only configured approvers can approve; with 
 | `reply` | Answer only; no action approval needed |
 | `system_info`, `list_processes` | System report; processes by CPU, memory or name |
 | `kill_process` | Stop by PID or name; critical and configured protected names, PID ≤ 4, and assistant/parent PID are refused (best-effort process-name check) |
-| `open`, `open_url` | Open a target or an HTTP(S) URL; `open` can launch programs |
+| `open`, `open_url` | Open an HTTP(S)/mailto link or a named program or file. `open` refuses UNC paths, URI schemes such as `ms-msdt:`, `file:`, `search-ms:` and `shell:`, scripts and shortcuts (`.ps1`, `.bat`, `.cmd`, `.vbs`, `.js`, `.lnk`, `.msi`…), and credential files |
 | `screenshot`, `window_screenshot` | Approved JPEG photo with visible indicator; window capture never falls back to the full screen |
 | `watch_start`, `watch_speed` | Approved visible full-screen sharing session or interval change |
 | `lock_screen`, `notification`, `volume` | Lock, desktop notification, or volume key presses; volume needs an explicit mode (`mute`/`unmute`/`toggle`/`up`/`down`/`set`) or a numeric `level` — unknown or missing modes change nothing |
@@ -178,7 +207,7 @@ From a console in the project folder:
 | `[ollama] use_ollama`, `base_url`, `model`, `timeout` | Local model and fallback |
 | `[behaviour] max_plan_steps`, `command_timeout`, `max_output_chars`, `max_file_read_kb` | Step and output limits |
 | `[behaviour] max_send_file_mb`, `protected_processes`, `blocked_patterns` | Transfer cap and extra guardrails |
-| `[paths] workspace_root`, `allowed_roots` | Working directory and optional roots for ordinary file operations. If roots are empty, **transfer/search actions** still default to workspace root; ordinary file actions are unrestricted. PowerShell and `open` are not confined. |
+| `[paths] workspace_root`, `allowed_roots` | Working directory and optional roots for ordinary file operations. If roots are empty, **transfer/search actions** still default to workspace root; ordinary file actions are unrestricted. PowerShell and `open` are not confined. UNC, device-name and alternate-stream paths and credential files are refused everywhere. |
 | `[paths] downloads_dir` | Uploaded files location; must lie within allowed roots (or workspace root if roots are empty). Legacy screenshot-path settings are ignored for screen photos. |
 | `[paths] jobs_file`, `log_file` | Persistent jobs and metadata-only audit log. Memory is `memory.json` next to the jobs file. These files are not tamper-proof; restrict OS permissions. |
 | `[voice] model_path` | Local faster-whisper model directory; no automatic model download. |

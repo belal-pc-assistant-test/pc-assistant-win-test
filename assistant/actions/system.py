@@ -25,6 +25,7 @@ from .base import (
     ActionResult,
     human_bytes,
     human_duration,
+    ps_literal,
     run_powershell,
     run_process,
     truncate,
@@ -330,8 +331,7 @@ def kill_process(params: dict[str, str], ctx: ActionContext) -> ActionResult:
         if pid is not None:
             command = f"Stop-Process -Id {pid}" + (" -Force" if force else "")
         else:
-            safe_name = name.replace("'", "''")
-            command = f"Stop-Process -Name '{safe_name}'" + (" -Force" if force else "")
+            command = f"Stop-Process -Name {ps_literal(name)}" + (" -Force" if force else "")
         proc = run_powershell(command, min(config.command_timeout, 30), config.workspace_root)
         if proc.returncode != 0:
             raise ActionError(f"Could not kill: {(proc.stderr or 'unknown error')[:300]}")
@@ -505,8 +505,8 @@ def _clipboard_read() -> str:
 def _clipboard_write(text: str) -> None:
     """Platform clipboard write (monkeypatched in tests)."""
     if IS_WINDOWS:
-        payload = text.replace("'", "''")
-        proc = run_powershell(f"Set-Clipboard -Value '{payload}'", 20)
+        # Passed as base64 data, never pasted into the script (see ps_literal).
+        proc = run_powershell(f"Set-Clipboard -Value {ps_literal(text)}", 20)
         if proc.returncode != 0:
             raise ActionError(f"Could not write the clipboard: {(proc.stderr or '')[:200]}")
         return

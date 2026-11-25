@@ -29,6 +29,20 @@ from .wire import (OP_BINARY, OP_CLOSE, OP_PING, OP_PONG, OP_TEXT, ProtocolError
 
 COOKIE_NAME = "pcr_session"
 HEAD_TIMEOUT = 10.0
+
+
+def host_key(value: str) -> str:
+    """Canonical form of a host name for comparisons.
+
+    Lower case, with a default port (``:80`` or ``:443``) removed, so that
+    ``ABC.trycloudflare.com:443`` and ``abc.trycloudflare.com`` are the same host.
+    Used for both the allowed names and every incoming Host or Origin.
+    """
+    text = (value or "").strip().lower()
+    host, sep, port = text.rpartition(":")
+    if sep and port in ("80", "443"):
+        return host
+    return text
 STATS_INTERVAL = 1.0
 MAX_CONNECTIONS = 32
 PAGE_CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
@@ -51,7 +65,8 @@ class RemoteServer:
         self.on_sent = on_sent
         self.stats = stats
         self.on_denied = on_denied or (lambda decision: None)
-        self.allowed_hosts = {h.lower() for h in (allowed_hosts or set())}
+        self._allowed_hosts: set[str] = set()
+        self.allowed_hosts = allowed_hosts or set()
         self.sent = 0
         self.dropped = 0
         self._server: asyncio.base_events.Server | None = None
@@ -62,6 +77,31 @@ class RemoteServer:
     @property
     def viewer_connected(self) -> bool:
         return self._viewer is not None
+
+    @property
+    def allowed_hosts(self) -> set[str]:
+        """Public host names (the tunnel address), normalized with :func:`host_key`."""
+        return self._allowed_hosts
+
+    @allowed_hosts.setter
+    def allowed_hosts(self, hosts) -> None:
+        self._allowed_hosts = {host_key(h) for h in (hosts or set()) if host_key(h)}
+
+    def _loopback_names(self) -> set[str]:
+        return {host_key(f"127.0.0.1:{self.port}"), host_key(f"localhost:{self.port}"),
+                "127.0.0.1", "localhost"}
+
+    def host_ok(self, host_header: str | None) -> bool:
+        """Host must be the tunnel's public name or this machine's loopback name."""
+        key = host_key(host_header or "")
+        return bool(key) and (key in self.allowed_hosts or key in self._loopback_names())
+
+    def origin_ok(self, origin: str, host_header: str | None) -> bool:
+        """Origin must be the public tunnel name, or the same loopback host as Host."""
+        key = host_key(urllib.parse.urlsplit(origin).netloc)
+        if not key:
+            return False  # "null" and other opaque origins are refused
+        return key in self.allowed_hosts or key == host_key(host_header or "")
 
     async def start(self) -> int:
         self._server = await asyncio.start_server(self._client, host="127.0.0.1", port=0,
@@ -131,6 +171,16 @@ class RemoteServer:
             return
         path = request.target.split("?", 1)[0]
 
+        # DNS rebinding and cross-site requests: the Host and Origin must name
+        # this tunnel or this machine. Checked before any route or secret use.
+        if not self.host_ok(request.headers.get("host")):
+            await self._deny(writer, "host")
+            return
+        origin = request.headers.get("origin")
+        if origin is not None and not self.origin_ok(origin, request.headers.get("host")):
+            await self._deny(writer, "origin")
+            return
+
         if path.startswith("/connect/"):
             if request.method != "GET":
                 await self._deny(writer, "denied")
@@ -171,12 +221,9 @@ class RemoteServer:
             await self._respond(writer, 409, "Conflict", [], b"")
             return
         origin = request.headers.get("origin")
-        host = request.headers.get("host", "").lower()
-        if origin is not None:
-            origin_host = urllib.parse.urlsplit(origin).netloc.lower()
-            if origin_host not in self.allowed_hosts and origin_host != host:
-                await self._deny(writer, "origin")
-                return
+        if origin is not None and not self.origin_ok(origin, request.headers.get("host")):
+            await self._deny(writer, "origin")
+            return
         key = request.headers.get("sec-websocket-key", "")
         if not valid_ws_key(key) or request.headers.get("sec-websocket-version") != "13":
             await self._respond(writer, 400, "Bad Request", [], b"")

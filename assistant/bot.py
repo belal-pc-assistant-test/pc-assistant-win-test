@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+from collections import deque
 import platform
 import sys
 from urllib.parse import urlparse
@@ -66,6 +67,11 @@ from .remote.runtime import make_deps as make_remote_deps
 
 MAX_TG_LEN = 4000
 PLAN_TTL_SECONDS = 15 * 60      # a pending plan expires after 15 minutes
+MAX_PENDING_PLANS = 50          # hard cap on approvals waiting at once (memory bound)
+MAX_REQUEST_CHARS = 2000        # longer text is refused before any planner sees it
+FLOOD_LIMIT = 30                # updates per user accepted within FLOOD_WINDOW
+FLOOD_WINDOW = 10.0             # seconds
+UNAUTHORISED_LOG_INTERVAL = 60.0  # at most one log line per stranger per minute
 CODE_RE = re.compile(r"^(approve|deny|موافق|رفض|أرفض)\s+([A-Za-z0-9]{4,12})$", re.IGNORECASE)
 
 
@@ -390,6 +396,55 @@ async def send_long(bot: Any, chat_id: int, text: str, **kwargs: Any) -> None:
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
 
 
+class FloodGate:
+    """Sliding-window limit on how many updates one user may send.
+
+    Bounds Telegram flooding: a flooding allowed user (or a compromised
+    account) cannot keep the bot busy. Memory is bounded by pruning idle users.
+    """
+
+    def __init__(self, limit: int = FLOOD_LIMIT, window: float = FLOOD_WINDOW) -> None:
+        self.limit = limit
+        self.window = window
+        self._hits: dict[int, deque] = {}
+
+    def allow(self, user_id: int | None, now: float | None = None) -> bool:
+        key = -1 if user_id is None else user_id
+        now = time.monotonic() if now is None else now
+        hits = self._hits.setdefault(key, deque())
+        while hits and now - hits[0] > self.window:
+            hits.popleft()
+        if len(hits) >= self.limit:
+            return False
+        hits.append(now)
+        if len(self._hits) > 1000:
+            for other in [k for k, v in self._hits.items() if not v or now - v[-1] > self.window]:
+                self._hits.pop(other, None)
+        return True
+
+
+def _flood_ok(context, user_id: int | None) -> bool:
+    gate = context.application.bot_data.setdefault("flood", FloodGate())
+    return gate.allow(user_id)
+
+
+def _log_unauthorised(context, user_id: int | None) -> None:
+    """Record a stranger's attempt once a minute, without their message text.
+
+    Writing every attempt, with its text, would let anyone grow the log file.
+    """
+    seen: dict = context.application.bot_data.setdefault("unauthorised_seen", {})
+    key = -1 if user_id is None else user_id
+    now = time.monotonic()
+    last = seen.get(key)
+    if last is not None and now - last < UNAUTHORISED_LOG_INTERVAL:
+        return
+    if len(seen) >= 1000:
+        seen.clear()
+    seen[key] = now
+    audit.warning("Unauthorised access attempt ignored", user_id=user_id)
+
+
 def owner_only(func: Handler) -> Handler:
     """Only ids in allowed_user_ids may use the bot at all."""
 
@@ -398,16 +453,17 @@ def owner_only(func: Handler) -> Handler:
         user = update.effective_user
         user_id = user.id if user else None
         if getattr(update.effective_chat, "type", "private") != "private" or not config.is_allowed(user_id):
-            message = update.effective_message
-            audit.warning(
-                "Unauthorised access attempt ignored",
-                user_id=user_id,
-                username=getattr(user, "username", None),
-                text=(message.text or "")[:200] if message and message.text else None,
-            )
+            _log_unauthorised(context, user_id)
             if update.callback_query:
                 try:
                     await update.callback_query.answer("Not authorised.", show_alert=False)
+                except TelegramError:
+                    pass
+            return
+        if not _flood_ok(context, user_id):
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer("Too many updates; slow down.")
                 except TelegramError:
                     pass
             return
@@ -422,9 +478,17 @@ def owner_or_approver(func: Handler) -> Handler:
         user = update.effective_user
         if (getattr(update.effective_chat, "type", "private") != "private" or
                 not user or not config.is_allowed(user.id)):
+            _log_unauthorised(context, user.id if user else None)
             if update.callback_query:
                 try:
                     await update.callback_query.answer("Not authorised.")
+                except TelegramError:
+                    pass
+            return
+        if not _flood_ok(context, user.id):
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer("Too many updates; slow down.")
                 except TelegramError:
                     pass
             return
@@ -697,6 +761,13 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, req
                          *, from_voice: bool = False) -> None:
     message = update.effective_message
     user = update.effective_user
+    if len(request or "") > MAX_REQUEST_CHARS:
+        # Refused before any planner (local or cloud) sees the text.
+        await message.reply_text(
+            f"That request is too long ({len(request)} characters; the limit is {MAX_REQUEST_CHARS}). "
+            "Split it into smaller requests."
+        )
+        return
     if not context.application.bot_data["config"].is_allowed(user.id):
         await message.reply_text("Only a configured requester may create plans.")
         return
@@ -798,6 +869,11 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "♻️ <b>Superseded</b> — a newer plan replaced this one, so its code is void.",
             with_keyboard=False,
         )
+    if len(store) >= MAX_PENDING_PLANS:
+        await update.effective_message.reply_text(
+            "⚠️ Too many requests are waiting for approval. Approve, deny or let some expire, then retry."
+        )
+        return None
 
     if (context.application.bot_data.get("panic_epoch", 0) != panic_epoch or
             versions.get(proposal_key) != version or

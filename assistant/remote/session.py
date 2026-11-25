@@ -157,7 +157,7 @@ class RemoteSession:
         self._ensure_starting()
         public_url = await self._open_tunnel(port)
         self._ensure_starting()
-        self.server.allowed_hosts = {urlsplit(public_url).netloc}
+        self.server.allowed_hosts = {urlsplit(public_url).netloc}  # setter normalizes case and default port
         self.state = "active"
         self.started_at = self.deps.now()
         expires = time.strftime("%H:%M", time.localtime(time.time() + self.duration))
