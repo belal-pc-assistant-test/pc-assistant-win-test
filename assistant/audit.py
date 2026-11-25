@@ -130,9 +130,10 @@ def warning(message: str, **fields: Any) -> None:
     event("warning", **fields)
 
 
-def error(message: str, exc_info: bool = False) -> None:
-    # Tracebacks and exception messages may contain request data or credentials.
-    event("error")
+def error(message: str, exc_info: bool = False, **fields: Any) -> None:
+    # Tracebacks and exception messages may contain request data or credentials,
+    # so only the event name and whitelisted labels (e.g. reason=) are logged.
+    event("error", **fields)
 
 
 def tail(log_file: Path, lines: int = 60) -> str:

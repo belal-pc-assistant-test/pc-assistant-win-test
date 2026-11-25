@@ -105,3 +105,40 @@ class BatchFileTests(unittest.TestCase):
         # a console; comments mentioning the word are fine.
         self.assertIsNone(re.search(r"(?im)^\s*@?choice\b", raw))
         self.assertIn("set /p", raw.lower())
+
+
+class InstallerFlowTests(unittest.TestCase):
+    """Control flow of install.bat: every jump has a target, and no exit is silent."""
+
+    def _lines(self) -> list[str]:
+        return (PROJECT_DIR / "install.bat").read_text(encoding="utf-8").splitlines()
+
+    def test_every_goto_target_exists(self) -> None:
+        lines = self._lines()
+        labels = {line.strip()[1:].strip().lower() for line in lines if line.strip().startswith(":")}
+        targets = set()
+        for line in lines:
+            for match in re.finditer(r"goto\s+(\S+)", line, re.IGNORECASE):
+                targets.add(match.group(1).lower())
+        self.assertTrue(targets, "install.bat should use goto")
+        missing = sorted(t for t in targets if t != ":eof" and t not in labels)
+        self.assertEqual(missing, [], f"goto targets without a label: {missing}")
+
+    def test_every_exit_is_preceded_by_a_pause(self) -> None:
+        lines = [line.strip().lower() for line in self._lines()]
+        exits = [i for i, line in enumerate(lines) if line.startswith("exit /b")]
+        self.assertTrue(exits)
+        for i in exits:
+            previous = lines[max(0, i - 3):i]
+            self.assertTrue(any(line == "pause" for line in previous),
+                            f"exit at line {i + 1} is not preceded by pause")
+
+    def test_python_failure_paths_print_the_download_link(self) -> None:
+        text = (PROJECT_DIR / "install.bat").read_text(encoding="utf-8")
+        for label in (":no_python", ":old_python"):
+            match = re.search(rf"^{re.escape(label)}\s*$", text, re.M)
+            self.assertIsNotNone(match, label)
+            start = match.start()
+            block = text[start:start + 1200]
+            self.assertIn("https://www.python.org/downloads/windows/", block, label)
+            self.assertIn("Add python.exe to PATH", block, label)

@@ -442,7 +442,8 @@ def _log_unauthorised(context, user_id: int | None) -> None:
     if len(seen) >= 1000:
         seen.clear()
     seen[key] = now
-    audit.warning("Unauthorised access attempt ignored", user_id=user_id)
+    audit.warning("Unauthorised access attempt ignored", user_id=user_id,
+                  reason="unauthorised user")
 
 
 def owner_only(func: Handler) -> Handler:
@@ -1787,8 +1788,21 @@ async def cmd_remote(update, context):
 # Errors and lifecycle
 # ---------------------------------------------------------------------------
 
+def _error_label(exc: BaseException | None) -> str:
+    """A safe, lowercase label for the error class: "conflict", "network error"...
+
+    Only the class name is used (never its message, which can contain URLs or
+    request data). Both ``TimedOut`` and ``Conflict`` become readable labels.
+    """
+    if exc is None:
+        return "unknown"
+    name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", type(exc).__name__).lower()
+    return name if re.fullmatch(r"[a-z][a-z .\-]{0,39}", name) else "unknown"
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    audit.error(f"Telegram handler error: {context.error}", exc_info=True)
+    audit.error("Telegram handler error", exc_info=True,
+                reason=_error_label(context.error))
     if isinstance(update, Update) and update.effective_chat:
         try:
             await context.bot.send_message(
