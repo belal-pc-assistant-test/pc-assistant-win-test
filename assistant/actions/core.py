@@ -225,6 +225,13 @@ def read_text_file(path: Path) -> str:
 def read_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     config = ctx.config
     started = time.perf_counter()
+    # Fail closed: with no [paths] allowed_roots, the bot must not read any file
+    # on the PC. resolve_path only checks roots when they are set.
+    if not config.allowed_roots:
+        raise ActionError(
+            "Reading files is off until you list the folders it may read. "
+            "Set [paths] allowed_roots in config.ini."
+        )
     target = resolve_path(params.get("path", ""), config, "File path")
     if not target.exists():
         raise ActionError(f"File not found: {target}")

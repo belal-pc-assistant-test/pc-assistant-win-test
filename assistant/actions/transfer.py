@@ -84,15 +84,18 @@ def receive_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     if not file_id:
         raise ActionError("No Telegram file id to download.")
 
-    declared_size = 0
-    if (params.get("size") or "").strip().isdigit():
-        declared_size = int(params["size"])
-        limit_bytes = config.max_send_file_mb * 1024 * 1024
-        if declared_size > limit_bytes:
-            raise ActionError(
-                f"File is {human_bytes(declared_size)}, larger than "
-                f"max_send_file_mb ({config.max_send_file_mb} MB)."
-            )
+    # The size Telegram reported is checked before anything is downloaded. Without
+    # it the download would be unbounded, so a missing or invalid size is refused.
+    raw_size = (params.get("size") or "").strip()
+    if not raw_size.isdigit():
+        raise ActionError("Telegram did not report the file size, so the download is refused.")
+    declared_size = int(raw_size)
+    limit_bytes = config.max_send_file_mb * 1024 * 1024
+    if declared_size > limit_bytes:
+        raise ActionError(
+            f"File is {human_bytes(declared_size)}, larger than "
+            f"max_send_file_mb ({config.max_send_file_mb} MB)."
+        )
 
     roots = [normalize_path(p) for p in effective_roots(config)]
     if (params.get("target") or "").strip():
@@ -111,7 +114,13 @@ def receive_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
             raise ActionError("Destination already exists; request a new plan with another name.")
         destination = unique_destination(destination.parent, destination.name)
 
+    # Last check before the file is written: the destination must not be a link
+    # (os.replace would act on the link itself) and its folder must still be inside
+    # the allowed roots.
+    if destination.is_symlink():
+        raise ActionError("Destination is a link; refusing to replace it.")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    ensure_inside(normalize_path(destination.parent), roots, "Destination folder")
     fd, temp_name = tempfile.mkstemp(prefix=".tpa-", suffix=".part", dir=destination.parent)
     os.close(fd)
     partial = Path(temp_name)

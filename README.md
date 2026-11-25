@@ -44,6 +44,7 @@ Control your Windows PC from Telegram. You send a request, the assistant shows a
 * **Priority order:** `token.txt` first, then the `TELEGRAM_BOT_TOKEN` environment variable, then the per-user store, then a hidden prompt on first start.
 * **Empty file:** an empty or whitespace-only file is ignored and the next source is tried. An unreadable file or an invalid first line stops startup with an error. It is never silently replaced.
 * **Per-user store (optional):** `set_token.bat` saves the token under `%APPDATA%\TelegramPCAssistant`. `main.py --forget-token` deletes that stored copy only.
+* **Windows permissions.** When the bot saves a token, the file and its folder are set so that only your account is listed, as owner and as the only entry. SYSTEM, Administrators and OWNER RIGHTS are removed. You still own the file, so you can change it back. A token encrypted with DPAPI is kept even if that step fails. A plain-text token is never left behind if the step fails. This is not yet verified on a real Windows machine; see Security below.
 * **Keep it private.** Anyone who can read `token.txt` can control the bot. Never share or commit it. If it leaks, revoke it in @BotFather (`/revoke`), then save the new token.
 
 ## Commands
@@ -56,6 +57,8 @@ Control your Windows PC from Telegram. You send a request, the assistant shows a
 | `/privacy` | What leaves the PC |
 | `/cancel` | Cancel pending plans |
 | `/panic` | Stop everything: cancel plans, stop screen sharing and remote sessions, kill the tunnel |
+| `/pause` | Hold all new work until `/resume`. Stops screen sharing and remote sessions. The pause is saved and survives a restart. `/status`, `/resume` and `/panic` still work. A plan that is already running is not interrupted; use `/panic` for that |
+| `/resume` | Continue after `/pause` |
 | `/yes CODE`, `/no CODE` | Approve or deny a plan (`/approve` and `/deny` also work) |
 | `/screen`, `/window [title]` | One screenshot of the screen or of one window (needs approval) |
 | `/watch start [seconds] [minutes]`, `/watch speed N`, `/watch stop` | Visible screen sharing. Defaults: every 3 s, for 10 minutes |
@@ -146,7 +149,10 @@ The second line downloads the model (not tested in this build). The model folder
 * At most 50 plans can wait for approval. Each user may send 30 updates per 10 seconds. Requests over 2000 characters are refused.
 * Planner output must match the schema and an action allowlist. `remote_start` can only be started with `/remote start`.
 * Paths: UNC and network paths (`\\server\share`, `//server`, `\\?\`, `\??\`), reserved device names (`CON`, `NUL`, `COM1`, `COM¹`, `CONIN$`…) and alternate data streams (`file.txt:stream`) are refused.
-* Uploads: Telegram's declared size is checked before download. Received names are sanitized, and the file is written to a temporary name.
+* Uploads: an upload with no size reported by Telegram is refused. Telegram's reported size is checked before download, and the size of the downloaded file is checked again afterwards. Received names are sanitized, the file is written to a temporary name, and a link at the destination is refused.
+* `read_file` refuses every file until `[paths] allowed_roots` lists at least one folder. Once it is set, `read_file` and `send_file` resolve symbolic links and junctions first, then check the real path against the allowed folders.
+* `/pause` holds all new work until `/resume`. While paused, every request, approval button and scheduled job is refused or deferred. Only the allowed user can pause or resume.
+* The bot refuses to start when it runs as Administrator (`shell32.IsUserAnAdmin`). It prints a message, tries to tell the allowed users on Telegram, and exits with code 5. There is no override flag. `main.py --check` reports this too. The bot does not ask for elevation and does not bypass UAC.
 * File actions refuse the protected names `token.json`, `token.txt` and `.env`, including the same names with trailing dots or spaces and the 8.3 short form `TOKEN~1.TXT`. Writes to the Windows Startup folder are refused. The token is never written to `config.ini` or to plans. Every message the bot sends to Telegram (replies, errors, edited text and captions) has the token replaced with `[REDACTED]`, and a file that contains the token is not sent. The audit log removes it too. Text you type to the bot is kept as you sent it, so never paste the token into the chat.
 * Clipboard text and notification text reach PowerShell encoded as base64, not pasted into the script.
 * Remote: the link secret is at least 32 random bytes and new for each session. Failed attempts are rate-limited: 5 failures in 60 seconds cause a 60-second lockout, and 25 failures in total end the session. Host and Origin headers are checked on every request. Input is accepted only after a viewer authenticates.
@@ -155,12 +161,15 @@ The second line downloads the model (not tested in this build). The model folder
 
 **Limits (not enforced, or not fully reviewed):**
 * **Approved actions run with your account's rights.** `powershell`, `!` commands, opening programs and `write_file` are not sandboxed. Unless you set `allowed_roots`, ordinary file actions can reach any folder your account can access. Read every plan before approving it.
-* **Some file paths are not yet confined.** `read_file` has no roots check when `allowed_roots` is empty. `send_file` may follow a symlink outside the allowed folders. `receive_file` checks the size of the received file only after the download finishes, and it does not yet check the destination for symlinks before the final rename. These are open items.
+* **Upload destination check is not atomic.** `receive_file` checks for a link at the destination just before it writes. Another program that changes the downloads folder during that short window could still win the race. The size limit is checked before the download and again after it.
+* **`/pause` does not interrupt a running plan.** It stops new work, screen sharing and remote sessions. `/panic` stops a running plan.
+* **Administrator check is a start-up refusal, not a sandbox.** It stops the bot itself from starting elevated. It does not stop an administrator from running other programs.
 * **Not yet reviewed in full:** text routing, macros, chains, the reminder and briefing queues, and the stored config and token file permissions.
 * **Protections are name-based.** A copy of a credential under another name is not detected.
 * **Voice packages are range-pinned.** `requirements-voice.txt` pins `av` to `>=12,<16`, not one exact version, so a new release inside that range can be installed. `requirements.txt` is fully exact-pinned.
 * **Telegram keeps what it receives**, including results, uploads and plans.
-* **Not validated live on Windows:** PowerShell actions, clipboard, process control, DPAPI, screen capture, the banner, the `cloudflared` runtime, and live Telegram. These were tested with fakes in a Linux sandbox.
+* **Not validated live on Windows:** PowerShell actions, clipboard, process control, DPAPI, screen capture, the banner, the `cloudflared` runtime, live Telegram, the owner-only access list, junctions, the Administrator check on a real elevated process, and `/pause` across a real restart. These were tested with fakes or on Linux. The Windows-only tests in `tests/test_windows_real.py` are the check for them; they run on the GitHub Windows runner.
+* **Access list and other programs.** Removing SYSTEM and Administrators from the token file means a backup or security product that runs as SYSTEM may no longer read it. Your own account still can.
 * **Cloudflared pin:** the default download is `releases/latest`, so the version changes over time. Set `cloudflared_sha256` to pin it.
 
 ## Troubleshooting
@@ -178,7 +187,15 @@ The second line downloads the model (not tested in this build). The model folder
 
 ### Token not saved on Windows
 
-If `install.bat` or `set_token.bat` says the token was not saved, Windows would not restrict the file to your account. The bot refuses to leave a readable token behind. Create `token.txt` next to `install.bat` instead, or run the command again from your normal user account.
+If `install.bat` or `set_token.bat` says the token was not saved, Windows would not restrict the file to your account. The bot refuses to leave a readable plain-text token behind. Create `token.txt` next to `install.bat` instead, or run the command again from your normal user account.
+
+### The bot says it is running as Administrator
+
+Start `start_assistant.bat` (or `python main.py`) from a normal window, not from "Run as administrator". The bot does not run elevated. Run `main.py --check` to see the state.
+
+### The bot is paused
+
+Send `/resume` in Telegram. `/status` shows whether it is paused and since when. The pause is kept in `pause.json` next to `memory.json` in the `data` folder, so a restart does not clear it.
 
 ### Wrong user ID
 
@@ -216,4 +233,4 @@ Delete `token.txt` yourself. Run `main.py --forget-token` to remove the stored t
 python build_zip.py
 ```
 
-`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. `tests/test_windows_real.py` holds the tests that need real Windows (icacls, the token file, the loopback server, path rules, log handles). They skip everywhere else. Run them on a Windows PC or a Windows CI runner.
+`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. `tests/test_windows_real.py` holds the tests that need real Windows (the owner-only access list, the token file, the loopback server, path rules, junctions, log handles, the Administrator check). They skip everywhere else. Run them on a Windows PC or a Windows CI runner. `tests/test_round8.py` covers the Round 8 changes on Linux.

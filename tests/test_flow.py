@@ -300,6 +300,7 @@ class ConfirmationGateTests(unittest.TestCase):
         self.assertEqual(message.replies, [])
 
     def test_failed_step_reports_error_but_continues(self):
+        self.config.allowed_roots = [self.dir]  # read_file refuses while no folders are allowed
         plan = Plan(
             summary="mixed",
             steps=[

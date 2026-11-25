@@ -14,8 +14,9 @@ Protection:
   ``CryptProtectData`` so only the *same Windows user on the same machine* can
   decrypt it.  No key is stored anywhere.
 * **Fallback**: if DPAPI is unavailable the file is written as plain JSON and
-  locked down with ``icacls`` (Windows) / ``chmod 600`` (POSIX) so only the
-  current user can read it.  The protection actually used is written into the
+  locked down to the current user (an owner-only access list on Windows, set
+  and read back by PowerShell / ``chmod 600`` on POSIX) so only the current
+  user can read it.  The protection actually used is written into the
   file and reported by ``python main.py --check``.
 
 Lookup order (see ``config.py``): project-root ``token.txt``, then the
@@ -126,10 +127,9 @@ def _on_windows() -> bool:
 def _current_user_sid() -> str | None:
     """SID of the signed-in Windows user, or None.
 
-    The SID is used in icacls grants instead of the account name: names can
-    contain spaces, Arabic or other non-ASCII letters, and parentheses that
-    icacls would parse as permission syntax. SIDs are the same in every
-    display language.
+    The SID is used in access-list entries instead of the account name: names
+    can contain spaces, Arabic or other non-ASCII letters, and characters that
+    permission syntax would misread. SIDs are the same in every display language.
     """
     try:
         proc = subprocess.run(
@@ -144,20 +144,114 @@ def _current_user_sid() -> str | None:
     return value if proc.returncode == 0 and _SID_RE.fullmatch(value) else None
 
 
-def _icacls(args: list[str]) -> bool:
-    """Run icacls and report success from its exit code (its text is localized)."""
-    try:
-        proc = subprocess.run(["icacls", *args], capture_output=True, timeout=20, check=False)
-    except (OSError, subprocess.SubprocessError):
+# The access list is set and read back by one PowerShell script. Paths and SIDs
+# arrive in environment variables (never on the command line), so Arabic letters,
+# spaces and quotes reach Windows unchanged. The script:
+#   * turns off inheritance and removes every entry (inherited or explicit), so the
+#     SYSTEM, Administrators and OWNER RIGHTS entries that a new file receives from
+#     its creator's default access list are removed too;
+#   * grants full control to the current user only, and makes that user the owner;
+#   * prints a JSON report of what is on the object afterwards.
+# Python decides success from that report (see acl_is_owner_only), so the check is
+# the same on every Windows display language.
+_ACL_HEADER = r"""
+$ErrorActionPreference = 'Stop'
+$path = $env:TPA_ACL_PATH
+$sid = New-Object System.Security.Principal.SecurityIdentifier($env:TPA_ACL_SID)
+$acl = Get-Acl -LiteralPath $path
+"""
+_ACL_APPLY = r"""
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($entry in @($acl.Access)) { [void]$acl.RemoveAccessRule($entry) }
+if ($env:TPA_ACL_DIR -eq '1') {
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+} else {
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+}
+$grant = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inherit, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+[void]$acl.AddAccessRule($grant)
+$acl.SetOwner($sid)
+Set-Acl -LiteralPath $path -AclObject $acl
+$acl = Get-Acl -LiteralPath $path
+"""
+_ACL_REPORT = r"""
+$entries = @()
+foreach ($entry in $acl.Access) {
+    try { $value = $entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+    catch { $value = [string]$entry.IdentityReference }
+    $entries += [pscustomobject]@{ sid = $value; inherited = [bool]$entry.IsInherited }
+}
+$owner = ''
+try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { $owner = '' }
+[pscustomobject]@{ owner = $owner; entries = @($entries) } | ConvertTo-Json -Compress -Depth 4
+"""
+_ACL_READ_SCRIPT = _ACL_HEADER + _ACL_REPORT
+_ACL_APPLY_SCRIPT = _ACL_HEADER + _ACL_APPLY + _ACL_REPORT
+
+
+def _last_json_object(text: str) -> dict | None:
+    for line in reversed((text or "").strip().splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def acl_is_owner_only(report: dict | None, sid: str) -> bool:
+    """True when the report lists exactly one entry, the user's own, and the user owns the object.
+
+    An inherited entry counts as a failure, and so does an empty list, so a missing
+    report can never pass.
+    """
+    if not isinstance(report, dict) or not sid:
         return False
-    return proc.returncode == 0
+    entries = report.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return False
+    if report.get("owner") != sid:
+        return False
+    return all(isinstance(entry, dict) and entry.get("sid") == sid and entry.get("inherited") is False
+               for entry in entries)
+
+
+def _run_acl_script(script: str, target: Path, sid: str, *, directory: bool) -> dict | None:
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    env = dict(os.environ, TPA_ACL_PATH=str(target), TPA_ACL_SID=sid,
+               TPA_ACL_DIR="1" if directory else "0")
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, check=False, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return _last_json_object(proc.stdout)
+
+
+def windows_acl_report(target: Path) -> dict | None:
+    """Read-only: who is on the access list of ``target`` and who owns it (Windows only)."""
+    sid = _current_user_sid()
+    if not sid:
+        return None
+    return _run_acl_script(_ACL_READ_SCRIPT, target, sid, directory=False)
+
+
+def _apply_owner_only(target: Path, sid: str, *, directory: bool) -> bool:
+    report = _run_acl_script(_ACL_APPLY_SCRIPT, target, sid, directory=directory)
+    return acl_is_owner_only(report, sid)
 
 
 def _lock_down(path: Path, *, is_windows: bool | None = None) -> str:
-    """Restrict a file to the current user. Returns "icacls", "chmod600", "partial" or "none".
+    """Restrict a file to the current user. Returns "acl", "chmod600" or "none".
 
-    On Windows the explicit grant is applied first and only then is inherited
-    access removed, so a failed grant never leaves the file locked to nobody.
+    "acl" means the read-back showed only the current user, as owner and as the sole
+    entry (see :func:`acl_is_owner_only`). Anything else is reported as "none", and
+    the caller must not treat the file as protected.
     """
     if is_windows is None:
         is_windows = _on_windows()
@@ -165,11 +259,7 @@ def _lock_down(path: Path, *, is_windows: bool | None = None) -> str:
         sid = _current_user_sid()
         if not sid:
             return "none"
-        if not _icacls([str(path), "/grant:r", f"*{sid}:F"]):
-            return "none"
-        if not _icacls([str(path), "/inheritance:r"]):
-            return "partial"
-        return "icacls"
+        return "acl" if _apply_owner_only(path, sid, directory=False) else "none"
     try:
         path.chmod(0o600)
         return "chmod600"
@@ -177,18 +267,18 @@ def _lock_down(path: Path, *, is_windows: bool | None = None) -> str:
         return "none"
 
 
-def _harden_dir(directory: Path, *, is_windows: bool | None = None) -> None:
+def _harden_dir(directory: Path, *, is_windows: bool | None = None) -> bool:
+    """Make a folder owner-only, so files created inside it inherit that. Returns success."""
     if is_windows is None:
         is_windows = _on_windows()
     if is_windows:
         sid = _current_user_sid()
-        if sid and _icacls([str(directory), "/grant:r", f"*{sid}:(OI)(CI)F"]):
-            _icacls([str(directory), "/inheritance:r"])
-        return
+        return bool(sid) and _apply_owner_only(directory, sid, directory=True)
     try:
         directory.chmod(0o700)
+        return True
     except OSError:
-        pass
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +366,7 @@ def save_token(token: str, path: Path | None = None) -> Path:
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
     method = _lock_down(target)
-    if protection == "plain" and _on_windows() and method != "icacls":
+    if protection == "plain" and _on_windows() and method != "acl":
         # Fail closed: a readable plain-text token must not be left behind on a
         # Windows account where the owner-only restriction could not be applied.
         try:
@@ -302,7 +392,7 @@ def protection_of(path: Path | None = None) -> str:
     if protection == "dpapi":
         return "DPAPI (encrypted, current Windows user only)"
     if os.name == "nt":
-        return "plain file + icacls (current user only)"
+        return "plain file, access list limited to the current user"
     return "plain file + chmod 600"
 
 

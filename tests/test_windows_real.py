@@ -13,9 +13,11 @@ therefore runs everywhere.
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
 import http.client
 import io
+import json
 import locale
 import logging
 import os
@@ -175,11 +177,15 @@ class TokenStoreWindowsTests(unittest.TestCase):
         target = self.root / "token.json"
         target.write_text("{}", encoding="utf-8")
         method = token_store._lock_down(target)
-        self.assertEqual(method, "icacls")
-        account, _sid = current_identity()
+        self.assertEqual(method, "acl")
+        account, sid = current_identity()
+        # Independent check: icacls lists exactly the current user, and no SYSTEM,
+        # Administrators or OWNER RIGHTS entry is left behind.
         accounts = icacls_accounts(target)
         self.assertEqual({_short_name(a) for a in accounts}, {_short_name(account)},
                          f"icacls lists {accounts}; only the current user may have access")
+        # Same answer from the SID-level read-back: one explicit entry, and the user owns the file.
+        self.assertTrue(token_store.acl_is_owner_only(token_store.windows_acl_report(target), sid))
 
     def test_save_then_read_back_in_a_folder_with_spaces_and_arabic_letters(self):
         target = self.root / ARABIC_FOLDER / "store with spaces" / "token.json"
@@ -188,14 +194,20 @@ class TokenStoreWindowsTests(unittest.TestCase):
         self.assertEqual(token_store.load_stored_token(target), TOKEN)
 
         # DPAPI is the normal protection on Windows: the token must not be readable on disk.
-        self.assertEqual(token_store.protection_of(target), "dpapi")
+        stored = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(stored["protection"], "dpapi")
         self.assertNotIn(TOKEN, target.read_text(encoding="utf-8"))
+        # The label is a human sentence, so check its start rather than the stored word.
+        self.assertTrue(token_store.protection_of(target).startswith("DPAPI"),
+                        token_store.protection_of(target))
 
-        account, _sid = current_identity()
+        account, sid = current_identity()
         for path in (target, target.parent):
             accounts = icacls_accounts(path)
             self.assertEqual({_short_name(a) for a in accounts}, {_short_name(account)},
                              f"icacls on {path.name} lists {accounts}")
+            self.assertTrue(token_store.acl_is_owner_only(token_store.windows_acl_report(path), sid),
+                            f"read-back of {path.name} is not owner-only")
 
         self.assertTrue(token_store.delete_token(target))
         self.assertFalse(target.exists())
@@ -369,6 +381,75 @@ class LogRotationWindowsTests(unittest.TestCase):
         for path in list(folder.iterdir()):
             path.unlink()
         self.assertEqual(list(folder.iterdir()), [])
+
+
+# ---------------------------------------------------------------------------
+# Round 8: links, the Administrator check, and folder hardening on real Windows
+# ---------------------------------------------------------------------------
+
+def _make_junction(link: Path, target: Path) -> None:
+    """A directory junction, made by PowerShell. Needs no special privilege, unlike a symbolic link.
+
+    The paths travel in environment variables, so spaces and Arabic letters survive.
+    """
+    script = ("New-Item -ItemType Junction -Path $env:TPA_JUNCTION_LINK "
+              "-Target $env:TPA_JUNCTION_TARGET | Out-Null")
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    env = dict(os.environ, TPA_JUNCTION_LINK=str(link), TPA_JUNCTION_TARGET=str(target))
+    proc = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                          capture_output=True, check=False, env=env)
+    if proc.returncode != 0 or not link.exists():
+        raise unittest.SkipTest(f"could not create a junction: {proc.stderr[-300:]!r}")
+
+
+@ONLY_WINDOWS
+class WindowsLinkAndElevationTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.root = _new_folder("tpa link")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.workspace = self.root / ARABIC_FOLDER / "workspace"
+        self.outside = self.root / "outside folder"
+        self.workspace.mkdir(parents=True)
+        self.outside.mkdir()
+        (self.outside / "secret.txt").write_text("outside", encoding="utf-8")
+
+    def _config(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(allowed_roots=[self.workspace], workspace_root=self.workspace)
+
+    def test_junction_pointing_outside_the_roots_is_refused(self):
+        from assistant.actions.base import resolve_in_roots
+        junction = self.workspace / "linked folder"
+        _make_junction(junction, self.outside)
+        with self.assertRaises(ActionError):
+            resolve_in_roots(str(junction / "secret.txt"), self._config(), "File path")
+        with self.assertRaises(ActionError):
+            resolve_in_roots("linked folder\\secret.txt", self._config(), "File path")
+
+    def test_file_symlink_pointing_outside_the_roots_is_refused(self):
+        from assistant.actions.base import resolve_in_roots
+        link = self.workspace / "link.txt"
+        try:
+            os.symlink(self.outside / "secret.txt", link)
+        except OSError as exc:
+            self.skipTest(f"symbolic links need a privilege this account lacks: {exc}")
+        with self.assertRaises(ActionError):
+            resolve_in_roots(str(link), self._config(), "File path")
+
+    def test_is_administrator_gives_a_definite_answer_on_windows(self):
+        from assistant import elevation
+        answer = elevation.is_administrator()
+        self.assertIn(answer, (True, False), "IsUserAnAdmin should always answer on Windows")
+
+    def test_harden_dir_on_a_real_folder_leaves_only_the_current_user(self):
+        folder = self.root / ARABIC_FOLDER / "owner only folder"
+        folder.mkdir(parents=True)
+        self.assertTrue(token_store._harden_dir(folder))
+        account, sid = current_identity()
+        accounts = icacls_accounts(folder)
+        self.assertEqual({_short_name(a) for a in accounts}, {_short_name(account)})
+        self.assertTrue(token_store.acl_is_owner_only(token_store.windows_acl_report(folder), sid))
 
 
 if __name__ == "__main__":

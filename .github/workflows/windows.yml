@@ -42,7 +42,7 @@ jobs:
         shell: cmd
         continue-on-error: true
         run: |
-          .venv\Scripts\python.exe main.py --plan "show system info"
+          .venv\Scripts\python.exe tests\ci_run_main.py --plan "show system info"
       - name: Real Telegram API check and short bot run
         shell: pwsh
         continue-on-error: true
@@ -53,7 +53,7 @@ jobs:
           $me = Invoke-RestMethod "https://api.telegram.org/bot$env:BOT_TOKEN/getMe"
           Write-Host "getMe ok: $($me.ok) username: $($me.result.username)"
           [IO.File]::WriteAllText("$PWD\token.txt", $env:BOT_TOKEN)
-          $p = Start-Process -FilePath ".venv\Scripts\python.exe" -ArgumentList "main.py","--no-token-prompt" -RedirectStandardOutput out.txt -RedirectStandardError err.txt -PassThru -NoNewWindow
+          $p = Start-Process -FilePath ".venv\Scripts\python.exe" -ArgumentList "tests\ci_run_main.py","--no-token-prompt" -RedirectStandardOutput out.txt -RedirectStandardError err.txt -PassThru -NoNewWindow
           Start-Sleep -Seconds 30
           $alive = -not $p.HasExited
           Write-Host "bot still running after 30s: $alive"

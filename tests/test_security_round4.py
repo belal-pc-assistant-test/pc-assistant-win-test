@@ -69,6 +69,9 @@ class PathSyntaxTests(unittest.TestCase):
 
     def test_unc_paths_are_refused_by_every_file_action(self):
         unc = r"\\attacker\share\loot.txt"
+        # read_file refuses everything while no folders are allowed, so give it roots here:
+        # the UNC guard must still hold once reading is switched on.
+        self.config.allowed_roots = [self.config.workspace_root]
         for action, params in (
             ("read_file", {"path": unc}),
             ("write_file", {"path": unc, "content": "x"}),
@@ -116,7 +119,7 @@ class PathSyntaxTests(unittest.TestCase):
     def test_received_upload_with_hostile_name_lands_in_downloads(self):
         transport = FakeTransport(b"payload")
         ctx = ActionContext(config=self.config, transport=transport)
-        result = transfer_mod.receive_file({"file_id": "f", "file_name": r"..\..\CON.exe"}, ctx)
+        result = transfer_mod.receive_file({"file_id": "f", "file_name": r"..\..\CON.exe", "size": "7"}, ctx)
         self.assertTrue(result.ok, result.output)
         saved = list(self.config.downloads_dir.iterdir())
         self.assertEqual([p.name for p in saved], ["_CON.exe"])

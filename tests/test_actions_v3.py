@@ -116,13 +116,18 @@ class ActionTests(unittest.TestCase):
         self.assertFalse(self.run_action('send_file', {'path':str(file)}).ok)
 
     def test_receive_file_and_cleanup(self):
-        result = self.run_action('receive_file', {'file_id':'abc', 'file_name':'../report.txt'}, transport=FakeTransport(b'hello'))
+        result = self.run_action('receive_file', {'file_id':'abc', 'file_name':'../report.txt', 'size':'5'}, transport=FakeTransport(b'hello'))
         self.assertTrue(result.ok, result.output)
         self.assertEqual((self.config.downloads_dir / 'report.txt').read_bytes(), b'hello')
-        result = self.run_action('receive_file', {'file_id':'abc', 'file_name':'report.txt'}, transport=FakeTransport(b'next'))
+        result = self.run_action('receive_file', {'file_id':'abc', 'file_name':'report.txt', 'size':'4'}, transport=FakeTransport(b'next'))
         self.assertTrue(result.ok); self.assertTrue((self.config.downloads_dir / 'report (1).txt').exists())
         self.config.max_send_file_mb = 0
-        result = self.run_action('receive_file', {'file_id':'abc', 'file_name':'big.bin'}, transport=FakeTransport(b'bad'))
+        # Declared size over the limit: refused before any download.
+        transport = FakeTransport(b'bad')
+        result = self.run_action('receive_file', {'file_id':'abc', 'file_name':'big.bin', 'size':'3'}, transport=transport)
+        self.assertFalse(result.ok); self.assertEqual(transport.calls, [])
+        # A size that lies (reported 0, actually 3): the post-download check still refuses it.
+        result = self.run_action('receive_file', {'file_id':'abc', 'file_name':'big.bin', 'size':'0'}, transport=FakeTransport(b'bad'))
         self.assertFalse(result.ok); self.assertFalse(list(self.config.downloads_dir.glob('*.part')))
 
     def test_find_files_and_url_guard(self):

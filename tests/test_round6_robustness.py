@@ -419,46 +419,75 @@ class WindowsTokenProtectionTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_grant_is_applied_before_inheritance_is_removed(self):
-        calls: list[list[str]] = []
-        with mock.patch.object(token_store, "_current_user_sid", return_value=SID), \
-                mock.patch.object(token_store, "_icacls", side_effect=lambda a: calls.append(a) or True):
-            method = token_store._lock_down(self.path, is_windows=True)
-        self.assertEqual(method, "icacls")
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][0], str(self.path))            # Arabic and spaces stay one argument
-        self.assertIn("/grant:r", calls[0])
-        self.assertIn(f"*{SID}:F", calls[0])                     # SID, not the account name
-        self.assertEqual(calls[1], [str(self.path), "/inheritance:r"])
+    def _owner_only(self, sid=SID):
+        return {"owner": sid, "entries": [{"sid": sid, "inherited": False}]}
 
-    def test_failed_grant_leaves_inheritance_alone(self):
-        calls: list[list[str]] = []
+    def test_one_script_run_sets_owner_only_and_reads_back(self):
         with mock.patch.object(token_store, "_current_user_sid", return_value=SID), \
-                mock.patch.object(token_store, "_icacls", side_effect=lambda a: calls.append(a) or False):
+                mock.patch.object(token_store, "_run_acl_script",
+                                  return_value=self._owner_only()) as run:
             method = token_store._lock_down(self.path, is_windows=True)
-        self.assertEqual(method, "none")
-        self.assertEqual(len(calls), 1, "no inheritance removal after a failed grant")
+        self.assertEqual(method, "acl")
+        run.assert_called_once()
+        script, target, sid = run.call_args.args[0], run.call_args.args[1], run.call_args.args[2]
+        self.assertIn("SetAccessRuleProtection($true, $false)", script)   # inheritance off, nothing copied
+        self.assertIn("RemoveAccessRule", script)                          # every other entry removed
+        self.assertIn("SetOwner($sid)", script)
+        self.assertEqual(target, self.path)                                # the path goes in as data
+        self.assertEqual(sid, SID)                                         # the SID, not the account name
+        self.assertEqual(run.call_args.kwargs, {"directory": False})
 
-    def test_failed_inheritance_removal_is_reported_as_partial(self):
-        results = iter([True, False])
+    def test_extra_entry_in_the_read_back_is_refused(self):
+        report = {"owner": SID, "entries": [{"sid": SID, "inherited": False},
+                                            {"sid": "S-1-5-18", "inherited": False}]}
         with mock.patch.object(token_store, "_current_user_sid", return_value=SID), \
-                mock.patch.object(token_store, "_icacls", side_effect=lambda a: next(results)):
-            self.assertEqual(token_store._lock_down(self.path, is_windows=True), "partial")
+                mock.patch.object(token_store, "_run_acl_script", return_value=report):
+            self.assertEqual(token_store._lock_down(self.path, is_windows=True), "none")
+
+    def test_inherited_entry_in_the_read_back_is_refused(self):
+        report = {"owner": SID, "entries": [{"sid": SID, "inherited": True}]}
+        with mock.patch.object(token_store, "_current_user_sid", return_value=SID), \
+                mock.patch.object(token_store, "_run_acl_script", return_value=report):
+            self.assertEqual(token_store._lock_down(self.path, is_windows=True), "none")
+
+    def test_wrong_owner_is_refused(self):
+        report = {"owner": "S-1-5-32-544", "entries": [{"sid": SID, "inherited": False}]}
+        with mock.patch.object(token_store, "_current_user_sid", return_value=SID), \
+                mock.patch.object(token_store, "_run_acl_script", return_value=report):
+            self.assertEqual(token_store._lock_down(self.path, is_windows=True), "none")
+
+    def test_failed_script_or_unreadable_output_is_refused(self):
+        for report in (None, {}, {"owner": SID, "entries": []}, "text"):
+            with self.subTest(report=report), \
+                    mock.patch.object(token_store, "_current_user_sid", return_value=SID), \
+                    mock.patch.object(token_store, "_run_acl_script", return_value=report):
+                self.assertEqual(token_store._lock_down(self.path, is_windows=True), "none")
 
     def test_no_sid_means_nothing_is_changed_and_reported(self):
         with mock.patch.object(token_store, "_current_user_sid", return_value=None), \
-                mock.patch.object(token_store, "_icacls") as icacls:
+                mock.patch.object(token_store, "_run_acl_script") as run:
             self.assertEqual(token_store._lock_down(self.path, is_windows=True), "none")
-        icacls.assert_not_called()
+        run.assert_not_called()
 
-    def test_directory_hardening_grants_before_removing_inheritance(self):
-        calls: list[list[str]] = []
+    def test_directory_hardening_uses_the_directory_flag(self):
         with mock.patch.object(token_store, "_current_user_sid", return_value=SID), \
-                mock.patch.object(token_store, "_icacls", side_effect=lambda a: calls.append(a) or True):
-            token_store._harden_dir(self.dir, is_windows=True)
-        self.assertIn("/grant:r", calls[0])
-        self.assertIn(f"*{SID}:(OI)(CI)F", calls[0])
-        self.assertEqual(calls[1][1], "/inheritance:r")
+                mock.patch.object(token_store, "_run_acl_script",
+                                  return_value=self._owner_only()) as run:
+            self.assertTrue(token_store._harden_dir(self.dir, is_windows=True))
+        self.assertEqual(run.call_args.kwargs, {"directory": True})
+
+    def test_acl_is_owner_only_rules(self):
+        ok = self._owner_only()
+        self.assertTrue(token_store.acl_is_owner_only(ok, SID))
+        self.assertFalse(token_store.acl_is_owner_only(None, SID))
+        self.assertFalse(token_store.acl_is_owner_only(ok, ""))
+        self.assertFalse(token_store.acl_is_owner_only(
+            {"owner": SID, "entries": [{"sid": SID, "inherited": None}]}, SID))
+
+    def test_last_json_line_wins_over_noise(self):
+        noisy = "warning: something\n" + '{"owner": "x", "entries": []}\n'
+        self.assertEqual(token_store._last_json_object(noisy), {"owner": "x", "entries": []})
+        self.assertIsNone(token_store._last_json_object("no json here"))
 
     def test_sid_is_parsed_from_powershell_output_only(self):
         ok = mock.Mock(returncode=0, stdout=f"{SID}\r\n")
@@ -486,7 +515,7 @@ class WindowsTokenProtectionTests(unittest.TestCase):
         with mock.patch.object(token_store, "_on_windows", return_value=True), \
                 mock.patch.object(token_store, "dpapi_available", return_value=False), \
                 mock.patch.object(token_store, "_harden_dir"), \
-                mock.patch.object(token_store, "_lock_down", return_value="icacls"):
+                mock.patch.object(token_store, "_lock_down", return_value="acl"):
             token_store.save_token(TOKEN, target)
         self.assertTrue(target.exists())
 

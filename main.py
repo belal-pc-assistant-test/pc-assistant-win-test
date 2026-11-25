@@ -26,7 +26,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from assistant import audit, token_store                          # noqa: E402
+from assistant import audit, elevation, token_store                # noqa: E402
 from assistant.config import Config, ConfigError, load_config      # noqa: E402
 from assistant.action_spec import VALID_ACTIONS                      # noqa: E402
 from assistant.planner import (                                    # noqa: E402
@@ -192,6 +192,44 @@ def _fail(label: str, detail: str = "") -> None:
     print(f"  [FAIL] {label}" + (f" — {detail}" if detail else ""))
 
 
+def _notify_owners(config: Config, text: str) -> bool:
+    """Best-effort Telegram notice to the allowed users. Never raises."""
+    if not config.bot_token or not config.allowed_user_ids:
+        return False
+    import asyncio
+
+    from telegram import Bot
+
+    from assistant.outbound import RedactingHTTPXRequest
+
+    async def send() -> None:
+        bot = Bot(token=config.bot_token, request=RedactingHTTPXRequest(connection_pool_size=1))
+        async with bot:
+            for user_id in sorted(config.allowed_user_ids):
+                await bot.send_message(chat_id=user_id, text=text)
+
+    try:
+        asyncio.run(asyncio.wait_for(send(), 20))
+        return True
+    except Exception as exc:  # the notice is optional; the refusal already happened
+        print(redact(f"   Could not send the Telegram notice: {exc}", config), file=sys.stderr)
+        return False
+
+
+def _refuse_elevated(config_path: str | None) -> int:
+    """Print the refusal, tell the owners on Telegram if possible, and exit with code 5."""
+    print("\n" + elevation.REFUSAL_TEXT + "\n", file=sys.stderr)
+    try:
+        config = load_config(config_path)
+    except ConfigError:
+        return elevation.ELEVATED_EXIT_CODE
+    audit.setup(config.log_file, config.log_level)
+    audit.event("refused_elevated")
+    _notify_owners(config, elevation.REFUSAL_TEXT)
+    audit.close()
+    return elevation.ELEVATED_EXIT_CODE
+
+
 def self_check(config: Config) -> int:
     problems = 0
     print("\n=== Telegram PC Assistant self check ===")
@@ -199,6 +237,18 @@ def self_check(config: Config) -> int:
     print(f"Python          : {sys.version.split()[0]} ({platform.system()} {platform.release()})")
     print(f"Project folder  : {PROJECT_DIR}")
     print(f"Config file     : {config.config_path}")
+
+    # 0) Elevation: the assistant refuses to start as Administrator.
+    print("\n[0] Running as")
+    elevated = elevation.is_administrator()
+    if elevated is True:
+        _fail("administrator", "yes: the assistant refuses to start elevated; "
+                               "start it from a normal (non-admin) window")
+        problems += 1
+    elif elevated is False:
+        _ok("administrator", "no")
+    else:
+        _warn("administrator", "could not be determined on this system")
 
     # 1) Config sanity
     print("\n[1] Configuration")
@@ -415,6 +465,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--forget-token", action="store_true", help="delete the stored bot token")
     parser.add_argument("--version", action="version", version=f"Telegram PC Assistant {__version__}")
     args = parser.parse_args(argv)
+
+    # --check only reports elevation; every other command refuses to run elevated.
+    if not args.check and elevation.is_administrator() is True:
+        return _refuse_elevated(args.config)
 
     if args.set_token:
         return cmd_set_token()

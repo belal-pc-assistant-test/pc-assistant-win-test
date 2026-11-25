@@ -253,6 +253,8 @@ class ActionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         self.config = make_config(self.dir)
+        # read_file refuses while no folders are allowed (Round 8); these tests read files.
+        self.config.allowed_roots = [self.dir]
 
     def tearDown(self):
         self.tmp.cleanup()

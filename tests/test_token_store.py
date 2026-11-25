@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 import os
 import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -120,7 +122,11 @@ class TokenStoreTests(unittest.TestCase):
         self.assertIn(token_store.protection_of(self.path), text)
 
     def test_store_dir_can_be_relocated(self):
-        self.assertEqual(token_store.store_dir(), Path(_ISOLATED).resolve())
+        # Set the folder for this test only: other test modules also set the variable at import time.
+        other = tempfile.mkdtemp(prefix="tpa-relocate-")
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        with mock.patch.dict(os.environ, {"TPA_TOKEN_STORE_DIR": other}):
+            self.assertEqual(token_store.store_dir(), Path(other).resolve())
 
     def test_validation_offline_is_graceful(self):
         # Empty/garbage tokens are rejected without any network call.

@@ -10,6 +10,7 @@ cancels everything pending and kills running child processes.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import html
 import json
 from collections import deque
@@ -34,10 +35,12 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -59,6 +62,7 @@ from .plan_code import fingerprint, normalize_code, unique_code
 from .scheduler import scheduler_loop
 from .memory import MemoryStore, language_for, NAME_RE
 from .outbound import RedactingHTTPXRequest
+from .pause import is_exempt as pause_exempt, load_pause, pause_path, save_pause
 from .voice import transcribe, VoiceUnavailable, MAX_VOICE_BYTES, MAX_VOICE_SECONDS
 from .sharing import (ScreenIndicator, WatchController, CaptureLease, capture_frame, photo_stream, foreground_window_handle,
                       MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL, DEFAULT_MINUTES, MAX_MINUTES)
@@ -95,7 +99,7 @@ MSG = {
         "Every plan comes with a 6-character code. Approve with the buttons or "
         "<code>approve CODE</code>; refuse with <code>deny CODE</code>.\n\n"
         "/help for everything · /status diagnostics · /privacy where your text goes · "
-        "/panic stops everything"
+        "/panic stops everything · /pause holds new work until /resume"
     ),
     "help": (
         "📖 <b>Commands</b>\n"
@@ -109,6 +113,8 @@ MSG = {
         "/cancel – drop my pending plans\n"
         "/yes CODE /no CODE – approve or deny; /approve and /deny are aliases\n"
         "/panic – cancel ALL pending plans and abort running ones\n"
+        "/pause – stop all new work until /resume (survives a restart); /status and /panic still work\n"
+        "/resume – continue after /pause\n"
         "/logs – last lines of the local audit log (approval required)\n"
         "/screen – full-screen photo; /window [title] – window photo (approval required)\n"
         "/watch start [seconds] [minutes] – visible screen sharing; /watch speed N – change speed with approval\n"
@@ -567,6 +573,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     pending = len(context.application.bot_data["plans"])
     lines = [
         "⚙️ <b>Status</b>",
+        paused_status_line(context.application.bot_data),
         f"Planner mode: <b>{_esc(mode)}</b> (chain: {_esc(chain)})",
         f"Cloud planner: {cloud_line}",
         f"Local planner: {local_line}",
@@ -634,6 +641,108 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text(MSG["cancelled"])
     else:
         await update.effective_message.reply_text(MSG["cancel_none"])
+
+
+PAUSED_NOTICE = "⏸ Paused. Nothing runs until you send /resume. /status and /panic still work."
+
+
+async def pause_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every other handler. While paused it answers the allowed user and stops the update.
+
+    Other users are left alone here: ``owner_only`` logs and refuses them as before.
+    """
+    app = context.application
+    if not app.bot_data.get("paused"):
+        return
+    config: Config = app.bot_data["config"]
+    user = update.effective_user
+    user_id = user.id if user else None
+    if getattr(update.effective_chat, "type", "private") != "private" or not config.is_allowed(user_id):
+        return
+    if update.callback_query is not None:
+        try:
+            await update.callback_query.answer("Paused. Send /resume to continue.", show_alert=False)
+        except TelegramError:
+            pass
+        raise ApplicationHandlerStop
+    message = update.effective_message
+    if message is None:
+        return
+    if pause_exempt(message.text):
+        return  # /resume, /panic and /status keep working
+    try:
+        await message.reply_text(PAUSED_NOTICE)
+    except TelegramError:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def _stop_background_for_pause(context: ContextTypes.DEFAULT_TYPE, reason: str) -> None:
+    """Stop the screen watch, remote session and capture lease the bot started itself."""
+    app = context.application
+    app.bot_data["watch_epoch"] = app.bot_data.get("watch_epoch", 0) + 1
+    app.bot_data["remote_epoch"] = app.bot_data.get("remote_epoch", 0) + 1
+    controller = app.bot_data.get("watch_controller")
+    if controller is not None:
+        controller.stop_now(reason)
+    remote = app.bot_data.get("remote_controller")
+    if remote is not None:
+        await remote.stop(reason)
+    lease = app.bot_data.get("screen_capture_lease")
+    if lease is not None:
+        lease.stop_now()
+
+
+def paused_status_line(bot_data) -> str:
+    """One status line: running, or paused since when."""
+    if not bot_data.get("paused"):
+        return "▶️ Running"
+    info = bot_data.get("paused_info") or {}
+    return f"⏸ <b>PAUSED</b> since {_esc(str(info.get('since', 'unknown')))} — send /resume to continue"
+
+
+@owner_only
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hold all new work until /resume. The state is saved, so it survives a restart."""
+    app = context.application
+    user_id = update.effective_user.id
+    if app.bot_data.get("paused"):
+        await update.effective_message.reply_text("⏸ Already paused. Send /resume to continue.")
+        return
+    info = {"paused": True, "since": datetime.now().isoformat(timespec="seconds"), "by": user_id}
+    app.bot_data["paused"] = True          # in memory first: a failed save must not leave work running
+    app.bot_data["paused_info"] = info
+    await _stop_background_for_pause(context, "pause")
+    try:
+        save_pause(app.bot_data["pause_file"], True, user_id)
+        saved_note = "The pause is saved and survives a restart."
+    except OSError as exc:
+        audit.warning("Could not save the pause file", error=str(exc))
+        saved_note = f"⚠️ The pause could NOT be saved ({exc}); it will end on a restart."
+    audit.event("paused", user_id=user_id)
+    await update.effective_message.reply_text(
+        "⏸ Paused. New requests, approvals and scheduled jobs wait until /resume. "
+        "A plan that is already running is not interrupted; /panic stops it.\n" + saved_note
+    )
+
+
+@owner_only
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    user_id = update.effective_user.id
+    if not app.bot_data.get("paused"):
+        await update.effective_message.reply_text("▶️ Not paused.")
+        return
+    app.bot_data["paused"] = False
+    app.bot_data["paused_info"] = None
+    try:
+        save_pause(app.bot_data["pause_file"], False, None)
+        note = ""
+    except OSError as exc:
+        audit.warning("Could not clear the pause file", error=str(exc))
+        note = f"\n⚠️ The saved pause could not be cleared ({exc}); send /resume again after a restart if it returns."
+    audit.event("resumed", user_id=user_id)
+    await update.effective_message.reply_text("▶️ Resumed." + note)
 
 
 @owner_or_approver
@@ -1298,7 +1407,11 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if document is None:
         return
 
-    size = document.file_size or 0
+    if document.file_size is None:
+        # Without the size Telegram reports, the download could be unbounded: refuse.
+        await message.reply_text("⚠️ Telegram did not say how big that file is, so I will not download it.")
+        return
+    size = document.file_size
     filename = sanitize_filename(document.file_name or f"file_{document.file_id[:8]}")
     limit = config.max_send_file_mb * 1024 * 1024
     if size > limit:
@@ -1522,6 +1635,8 @@ async def queue_briefing(application, job):
     config = application.bot_data['config']
     if not config.is_allowed(job.chat_id) or abort_requested():
         return False
+    if application.bot_data.get('paused'):
+        return False  # the job stays due and is queued after /resume
     store = application.bot_data['plans']
     _prune(store)
     if any(p.requester_id == job.chat_id for p in store.values()):
@@ -1826,6 +1941,8 @@ async def _post_init(application: Application) -> None:
             BotCommand("canceltask", "delete a reminder/task"),
             BotCommand("id", "show my Telegram user id"),
             BotCommand("cancel", "drop my pending plans"),
+            BotCommand("pause", "hold all new work until /resume"),
+            BotCommand("resume", "continue after /pause"),
             BotCommand("panic", "cancel everything and abort"),
             BotCommand("logs", "tail the local audit log"),
             BotCommand("note", "save a note (approval needed)"),
@@ -1849,6 +1966,9 @@ async def _post_init(application: Application) -> None:
     me = await bot.get_me()
     info = await asyncio.to_thread(planner.status)
     print(f"✅ Connected as @{me.username} (id {me.id})")
+    if application.bot_data.get("paused"):
+        since = (application.bot_data.get("paused_info") or {}).get("since", "unknown")
+        print(f"⏸  Paused since {since}. Send /resume in Telegram to continue.")
     print(f"   Allowed (may ask)   : {sorted(config.allowed_user_ids)}")
     print(f"   Approvers (may say yes): {sorted(config.approver_user_ids)}")
     print(f"   Planner mode        : {info['mode']}  (chain: {' → '.join(info['chain'])})")
@@ -1924,6 +2044,11 @@ def build_application(config: Config) -> Application:
     application.bot_data["config"] = config
     application.bot_data["planner"] = planner
     application.bot_data["plans"] = {}
+    # The pause survives a restart: it is read here, before any update is handled.
+    application.bot_data["pause_file"] = pause_path(config.jobs_file)
+    saved_pause = load_pause(application.bot_data["pause_file"])
+    application.bot_data["paused"] = saved_pause is not None
+    application.bot_data["paused_info"] = saved_pause
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
@@ -1933,6 +2058,9 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("jobs", cmd_jobs))
     application.add_handler(CommandHandler("canceltask", cmd_canceltask))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
+    application.add_handler(TypeHandler(Update, pause_gate), group=-1)
+    application.add_handler(CommandHandler("pause", cmd_pause))
+    application.add_handler(CommandHandler("resume", cmd_resume))
     application.add_handler(CommandHandler("panic", cmd_panic))
     application.add_handler(CommandHandler("logs", cmd_logs))
     application.add_handler(CommandHandler("note", cmd_note))
