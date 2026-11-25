@@ -10,5 +10,6 @@ f = d / "t.txt"; f.write_text("x")
 env = dict(os.environ, TPA_ACL_PATH=str(f), TPA_ACL_SID=sid or "", TPA_ACL_DIR="0")
 enc = base64.b64encode(ts._ACL_APPLY_SCRIPT.encode("utf-16-le")).decode()
 p = subprocess.run(["powershell","-NoProfile","-NonInteractive","-EncodedCommand",enc],capture_output=True,text=True,encoding="utf-8",errors="replace",env=env,timeout=60)
-print("rc", p.returncode); print("stdout", p.stdout[:800]); print("stderr", p.stderr[:1500])
+print("rc", p.returncode); print("stdout", p.stdout[:800]); import re
+print("errors", re.findall(r'<S S="Error">(.*?)</S>', p.stderr)[:12])
 print("lock_down", ts._lock_down(f))
