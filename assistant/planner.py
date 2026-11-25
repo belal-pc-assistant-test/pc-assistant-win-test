@@ -15,6 +15,7 @@ validation and path hygiene checks before the user ever sees it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import re
@@ -524,6 +525,10 @@ def extract_json_object(raw: str) -> dict[str, Any]:
             data = json.loads(text[start:end + 1])
         except json.JSONDecodeError as exc:
             raise PlanValidationError(f"the reply contained invalid JSON ({exc})") from None
+        except RecursionError:
+            raise PlanValidationError("the reply is nested too deeply to be a plan") from None
+    except RecursionError:
+        raise PlanValidationError("the reply is nested too deeply to be a plan") from None
 
     if isinstance(data, list):
         data = {"summary": "", "steps": data}
@@ -624,6 +629,25 @@ def normalize_plan_dict(data: dict[str, Any], max_steps: int) -> dict[str, Any]:
         first = normalized_steps[0]
         summary = first.get("description") or f"Plan: {first['action']}"
     return {"summary": summary or "Plan", "steps": normalized_steps}
+
+
+def _check_text_encodable(plan: dict[str, Any]) -> None:
+    """Refuse lone surrogates (JSON ``\\ud800``): they cannot be sent to Telegram or hashed."""
+    def walk(value: Any) -> None:
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise PlanValidationError("the plan contains text that is not valid Unicode") from None
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                walk(key)
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(plan)
 
 
 def _validate_builtin(plan: dict[str, Any], max_steps: int) -> None:
@@ -824,9 +848,19 @@ def build_plan(
     max_steps: int,
     workspace_root: Path | None = None,
 ) -> Plan:
-    """Model text → validated :class:`Plan`."""
-    data = extract_json_object(raw_content)
-    normalized = normalize_plan_dict(data, max_steps)
+    """Model text → validated :class:`Plan`.
+
+    Anything that is not a well-formed plan raises :class:`PlanValidationError`,
+    never another exception, so the planner chain can fall back cleanly.
+    """
+    try:
+        data = extract_json_object(raw_content)
+        normalized = normalize_plan_dict(data, max_steps)
+    except PlanValidationError:
+        raise
+    except (RecursionError, ValueError, TypeError, OverflowError, KeyError, AttributeError) as exc:
+        raise PlanValidationError(f"the reply could not be read as a plan ({type(exc).__name__})") from None
+    _check_text_encodable(normalized)
     _validate_builtin(normalized, max_steps)
     _validate_jsonschema(normalized, max_steps)
 
@@ -968,9 +1002,11 @@ class CloudPlanner:
         raw = (resp.headers.get("Retry-After") or "").strip()
         if raw:
             try:
-                return float(raw)
+                value = float(raw)
             except ValueError:
-                pass
+                value = float("nan")
+            if math.isfinite(value):   # "nan" / "inf" must not crash the int() below
+                return value
         try:
             body = resp.json()
         except Exception:
@@ -1390,6 +1426,9 @@ class Planner:
                 except PlannerError as exc:
                     failures.append(f"cloud: {exc}")
                     continue
+                except Exception as exc:  # a bug in one backend must not stop the chain
+                    failures.append(f"cloud: internal error ({type(exc).__name__})")
+                    continue
             if backend == "local":
                 if self.local is None:
                     continue
@@ -1398,6 +1437,9 @@ class Planner:
                     return self._finish(plan, failures)
                 except PlannerError as exc:
                     failures.append(f"local: {exc}")
+                    continue
+                except Exception as exc:
+                    failures.append(f"local: internal error ({type(exc).__name__})")
                     continue
             break  # keywords is the last resort, handled below
 

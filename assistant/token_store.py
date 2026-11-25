@@ -18,8 +18,9 @@ Protection:
   current user can read it.  The protection actually used is written into the
   file and reported by ``python main.py --check``.
 
-The ``TELEGRAM_BOT_TOKEN`` environment variable always wins over the store and
-is never written to disk.
+Lookup order (see ``config.py``): project-root ``token.txt``, then the
+``TELEGRAM_BOT_TOKEN`` environment variable, then this stored token. The
+environment variable is never written to disk.
 """
 
 from __future__ import annotations
@@ -114,21 +115,61 @@ def dpapi_available() -> bool:
 # File permissions
 # ---------------------------------------------------------------------------
 
-def _lock_down(path: Path) -> str:
-    """Restrict a file to the current user. Returns the method used."""
-    if os.name == "nt":
-        user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
-        if not user:
+_SID_RE = re.compile(r"S-\d+(?:-\d+)+")
+
+
+def _on_windows() -> bool:
+    """Single seam for the platform check, so tests can exercise the Windows branch."""
+    return os.name == "nt"
+
+
+def _current_user_sid() -> str | None:
+    """SID of the signed-in Windows user, or None.
+
+    The SID is used in icacls grants instead of the account name: names can
+    contain spaces, Arabic or other non-ASCII letters, and parentheses that
+    icacls would parse as permission syntax. SIDs are the same in every
+    display language.
+    """
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = (proc.stdout or "").strip()
+    return value if proc.returncode == 0 and _SID_RE.fullmatch(value) else None
+
+
+def _icacls(args: list[str]) -> bool:
+    """Run icacls and report success from its exit code (its text is localized)."""
+    try:
+        proc = subprocess.run(["icacls", *args], capture_output=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _lock_down(path: Path, *, is_windows: bool | None = None) -> str:
+    """Restrict a file to the current user. Returns "icacls", "chmod600", "partial" or "none".
+
+    On Windows the explicit grant is applied first and only then is inherited
+    access removed, so a failed grant never leaves the file locked to nobody.
+    """
+    if is_windows is None:
+        is_windows = _on_windows()
+    if is_windows:
+        sid = _current_user_sid()
+        if not sid:
             return "none"
-        try:
-            subprocess.run(
-                ["icacls", str(path), "/inheritance:r",
-                 "/grant:r", f"{user}:F"],
-                capture_output=True, timeout=20, check=False,
-            )
-            return "icacls"
-        except Exception:
+        if not _icacls([str(path), "/grant:r", f"*{sid}:F"]):
             return "none"
+        if not _icacls([str(path), "/inheritance:r"]):
+            return "partial"
+        return "icacls"
     try:
         path.chmod(0o600)
         return "chmod600"
@@ -136,18 +177,13 @@ def _lock_down(path: Path) -> str:
         return "none"
 
 
-def _harden_dir(directory: Path) -> None:
-    if os.name == "nt":
-        user = os.environ.get("USERNAME") or ""
-        if user:
-            try:
-                subprocess.run(
-                    ["icacls", str(directory), "/inheritance:r",
-                     "/grant:r", f"{user}:(OI)(CI)F"],
-                    capture_output=True, timeout=20, check=False,
-                )
-            except Exception:
-                pass
+def _harden_dir(directory: Path, *, is_windows: bool | None = None) -> None:
+    if is_windows is None:
+        is_windows = _on_windows()
+    if is_windows:
+        sid = _current_user_sid()
+        if sid and _icacls([str(directory), "/grant:r", f"*{sid}:(OI)(CI)F"]):
+            _icacls([str(directory), "/inheritance:r"])
         return
     try:
         directory.chmod(0o700)
@@ -239,7 +275,17 @@ def save_token(token: str, path: Path | None = None) -> Path:
     fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
-    _lock_down(target)
+    method = _lock_down(target)
+    if protection == "plain" and _on_windows() and method != "icacls":
+        # Fail closed: a readable plain-text token must not be left behind on a
+        # Windows account where the owner-only restriction could not be applied.
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise RuntimeError("Could not restrict the token file to your Windows account, "
+                           "so the token was not saved. Run the command again from an "
+                           "account that can change file permissions.")
     return target
 
 

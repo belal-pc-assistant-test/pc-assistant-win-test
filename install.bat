@@ -95,7 +95,13 @@ set "SAVE_TOKEN="
 set /p "SAVE_TOKEN=Save your bot token now in the private store? [y/N] "
 if /i not "%SAVE_TOKEN%"=="y" goto skip_token
 ".venv\Scripts\python.exe" main.py --set-token
+if errorlevel 1 goto token_not_saved
 set "STORED=1"
+goto after_token
+
+:token_not_saved
+echo   The token was not saved. Create token.txt next to install.bat instead (see below),
+echo   or run install.bat again.
 goto after_token
 
 :skip_token

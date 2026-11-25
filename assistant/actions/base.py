@@ -25,9 +25,12 @@ WINDOWS_DRIVE_RE = re.compile(r"^[a-zA-Z]:")
 #: (``CON.txt`` is still the console). Writing to or reading them can hang or
 #: hit hardware, so they are refused everywhere.
 RESERVED_DEVICE_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
     | {f"COM{i}" for i in range(10)}
     | {f"LPT{i}" for i in range(10)}
+    # Superscript digits are device names too: "COM\u00b9.txt" is COM1.
+    | {f"COM{d}" for d in "\u00b9\u00b2\u00b3"}
+    | {f"LPT{d}" for d in "\u00b9\u00b2\u00b3"}
 )
 
 #: Files that hold credentials. File actions never read, send, list or
@@ -201,7 +204,11 @@ def check_path_syntax(cleaned: str, what: str = "Path") -> None:
     """
     if "\x00" in cleaned:
         raise ActionError(f"{what} contains a NUL character.")
-    if cleaned.startswith(("\\\\", "//")):
+    # Windows treats "/" like "\\", so "/\\server\\share" is a UNC path just like
+    # "\\\\server\\share". Two leading separators mean UNC or a device (\\?\, \\.\),
+    # and "\\??\\" is the NT namespace (\\??\\UNC\\... is a network path too).
+    normalized_sep = cleaned.replace("/", "\\")
+    if normalized_sep.startswith("\\\\") or re.match(r"^\\\?\?\\", normalized_sep):
         raise ActionError(f"{what}: network (UNC) and device paths are not allowed.")
     body = cleaned[2:] if WINDOWS_DRIVE_RE.match(cleaned) else cleaned
     for part in re.split(r"[\\/]", body):
@@ -220,7 +227,10 @@ def ensure_not_protected(path: Path, what: str = "Path", *, for_write: bool = Fa
     ``path`` must already be normalized, so symlinks and junctions that point
     at a protected file are caught by their real target.
     """
-    if path.name.casefold() in PROTECTED_FILE_NAMES:
+    # Windows ignores trailing dots and spaces, so "token.txt." is token.txt, and the
+    # 8.3 short form of token.txt is TOKEN~1.TXT. Both are matched here.
+    name = path.name.rstrip(" .").casefold()
+    if name in PROTECTED_FILE_NAMES or re.fullmatch(r"token~\d+(\..*)?", name):
         raise ActionError(f"{what} is a protected credential file and cannot be used.")
     try:
         store_dir = normalize_path(token_store.token_path().parent)

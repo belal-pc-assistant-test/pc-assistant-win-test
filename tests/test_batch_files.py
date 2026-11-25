@@ -133,6 +133,46 @@ class InstallerFlowTests(unittest.TestCase):
             self.assertTrue(any(line == "pause" for line in previous),
                             f"exit at line {i + 1} is not preceded by pause")
 
+    def test_no_python_3_10_requirement_anywhere(self) -> None:
+        for path in BAT_FILES:
+            self.assertNotIn("3.10", path.read_text(encoding="utf-8", errors="replace"), path.name)
+
+    def test_every_error_block_reaches_a_pause(self) -> None:
+        """Each block that prints an [X] error must lead, by goto, to a pause before exit."""
+        lines = [line.strip() for line in self._lines()]
+        labels = {line[1:].strip().lower(): i for i, line in enumerate(lines) if line.startswith(":")}
+        error_labels = []
+        for name, start in labels.items():
+            block = lines[start:start + 40]
+            if any(line.startswith("echo") and "[X]" in line for line in block):
+                error_labels.append(name)
+        self.assertTrue(error_labels, "install.bat should have error blocks")
+        for name in error_labels:
+            index, hops, reached = labels[name], 0, False
+            while hops < 30:
+                hops += 1
+                line = lines[index].lower()
+                if line == "pause":
+                    reached = True
+                    break
+                if line.startswith("exit"):
+                    break
+                jump = re.match(r"goto\s+(\S+)", line)
+                if jump and jump.group(1) != ":eof":
+                    target = jump.group(1).lstrip(":")
+                    self.assertIn(target, labels, f"{name} jumps to a missing label {target}")
+                    index = labels[target]
+                    continue
+                index += 1
+            self.assertTrue(reached, f"error block :{name} does not reach pause")
+
+    def test_failed_token_save_is_not_reported_as_saved(self) -> None:
+        lines = [line.strip().lower() for line in self._lines()]
+        call = next(i for i, line in enumerate(lines) if "--set-token" in line)
+        guard = next(i for i in range(call, call + 3) if lines[i] == "if errorlevel 1 goto token_not_saved")
+        stored = next(i for i in range(call, call + 6) if lines[i] == 'set "stored=1"')
+        self.assertLess(guard, stored, "STORED may only be set after the save succeeded")
+
     def test_python_failure_paths_print_the_download_link(self) -> None:
         text = (PROJECT_DIR / "install.bat").read_text(encoding="utf-8")
         for label in (":no_python", ":old_python"):

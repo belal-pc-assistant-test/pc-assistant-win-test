@@ -145,9 +145,9 @@ The second line downloads the model (not tested in this build). The model folder
 * Approval codes are tied to the exact steps, single-use, expire after 15 minutes, and are replaced by a newer plan.
 * At most 50 plans can wait for approval. Each user may send 30 updates per 10 seconds. Requests over 2000 characters are refused.
 * Planner output must match the schema and an action allowlist. `remote_start` can only be started with `/remote start`.
-* Paths: UNC and network paths, reserved device names (`CON`, `NUL`, `COM1`…) and alternate data streams (`file.txt:stream`) are refused.
+* Paths: UNC and network paths (`\\server\share`, `//server`, `\\?\`, `\??\`), reserved device names (`CON`, `NUL`, `COM1`, `COM¹`, `CONIN$`…) and alternate data streams (`file.txt:stream`) are refused.
 * Uploads: Telegram's declared size is checked before download. Received names are sanitized, and the file is written to a temporary name.
-* File actions refuse the protected names `token.json`, `token.txt` and `.env`. Writes to the Windows Startup folder are refused. The token is never written to `config.ini`, plans or Telegram messages, and it is removed from audit text.
+* File actions refuse the protected names `token.json`, `token.txt` and `.env`, including the same names with trailing dots or spaces and the 8.3 short form `TOKEN~1.TXT`. Writes to the Windows Startup folder are refused. The token is never written to `config.ini` or to plans, and the audit log removes it. It is not removed from chat messages, so never paste the token into the chat.
 * Clipboard text and notification text reach PowerShell encoded as base64, not pasted into the script.
 * Remote: the link secret is at least 32 random bytes and new for each session. Failed attempts are rate-limited: 5 failures in 60 seconds cause a 60-second lockout, and 25 failures in total end the session. Host and Origin headers are checked on every request. Input is accepted only after a viewer authenticates.
 * The `cloudflared` download uses only the official `github.com/cloudflare/cloudflared/releases/` path, caps its size, and runs `cloudflared --version` before use.
@@ -158,6 +158,7 @@ The second line downloads the model (not tested in this build). The model folder
 * **Some file paths are not yet confined.** `read_file` has no roots check when `allowed_roots` is empty. `send_file` may follow a symlink outside the allowed folders. `receive_file` checks the size of the received file only after the download finishes, and it does not yet check the destination for symlinks before the final rename. These are open items.
 * **Not yet reviewed in full:** text routing, macros, chains, the reminder and briefing queues, and the stored config and token file permissions.
 * **Protections are name-based.** A copy of a credential under another name is not detected.
+* **Voice packages are range-pinned.** `requirements-voice.txt` pins `av` to `>=12,<16`, not one exact version, so a new release inside that range can be installed. `requirements.txt` is fully exact-pinned.
 * **Telegram keeps what it receives**, including results, uploads and plans.
 * **Not validated live on Windows:** PowerShell actions, clipboard, process control, DPAPI, screen capture, the banner, the `cloudflared` runtime, and live Telegram. These were tested with fakes in a Linux sandbox.
 * **Cloudflared pin:** the default download is `releases/latest`, so the version changes over time. Set `cloudflared_sha256` to pin it.
@@ -173,6 +174,11 @@ The second line downloads the model (not tested in this build). The model folder
 5. **Is the token valid?** Exit code **3** means no token was found: save one in `token.txt`, or run `set_token.bat`. Exit code **4** means Telegram rejected it: create a new one in @BotFather, then run `set_token.bat`.
 6. **Can this PC reach Telegram?** Check the internet connection, and any firewall or proxy that blocks `api.telegram.org`.
 7. **Run `check_setup.bat`** to repeat the self check. Then look in `logs\assistant.log`.
+8. **Telegram was unreachable when the bot started?** The assistant retries for about 30 seconds (waits of 2, 4, 8 and 16 s) before it gives up with a fatal error. Start it again once your connection is back.
+
+### Token not saved on Windows
+
+If `install.bat` or `set_token.bat` says the token was not saved, Windows would not restrict the file to your account. The bot refuses to leave a readable token behind. Create `token.txt` next to `install.bat` instead, or run the command again from your normal user account.
 
 ### Wrong user ID
 

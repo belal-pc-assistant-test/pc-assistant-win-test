@@ -342,6 +342,57 @@ def self_check(config: Config) -> int:
 # main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Startup with retries
+# ---------------------------------------------------------------------------
+
+STARTUP_ATTEMPTS = 5
+STARTUP_DELAYS = (2, 4, 8, 16)
+
+
+def run_polling_with_retries(make_application, *, attempts: int = STARTUP_ATTEMPTS,
+                             delays: tuple[float, ...] = STARTUP_DELAYS,
+                             sleep=None, config: Config | None = None) -> None:
+    """Start polling, retrying when Telegram is unreachable at startup.
+
+    python-telegram-bot checks the token (``get_me``) before polling starts, and that
+    call is not retried, so a brief network drop used to exit with a fatal error.
+    Each attempt builds a fresh Application. A rejected token (``InvalidToken``) is
+    not retried. Pending plans are in memory only, so a retry never runs one.
+    """
+    import time
+
+    from telegram.error import NetworkError
+
+    import asyncio
+
+    sleep = sleep or time.sleep
+    for attempt in range(1, attempts + 1):
+        application = make_application()
+        # run_polling closes the loop it used, so every attempt needs a fresh one.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            application.run_polling(
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,
+            )
+            return
+        except NetworkError as exc:
+            if attempt >= attempts:
+                raise
+            delay = delays[min(attempt - 1, len(delays) - 1)]
+            message = redact(str(exc), config)
+            audit.warning("Telegram not reachable at startup, retrying",
+                          attempt=attempt, wait_seconds=delay, error=message)
+            print(f"⚠️  Telegram is not reachable right now ({message}). "
+                  f"Retrying in {delay} s ({attempt}/{attempts}).", file=sys.stderr)
+            sleep(delay)
+        finally:
+            if not loop.is_closed():
+                loop.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     # Network library debug output can include Telegram URLs with bot tokens.
     # Keep third-party wire logs out of console and application log handlers.
@@ -401,7 +452,6 @@ def main(argv: list[str] | None = None) -> int:
 
     from assistant.bot import build_application
 
-    application = build_application(config)
     print("\n" + "=" * 62)
     print(f" Telegram PC Assistant {__version__} is starting (polling mode).")
     print(" Every action needs a ✅ confirmation (button or `approve CODE`).")
@@ -417,9 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        application.run_polling(
-            allowed_updates=["message", "callback_query"],
-            drop_pending_updates=True,
+        run_polling_with_retries(
+            lambda: build_application(config), config=config,
         )
     except KeyboardInterrupt:
         print("\nStopping (Ctrl+C)…")

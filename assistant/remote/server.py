@@ -229,14 +229,20 @@ class RemoteServer:
             await self._respond(writer, 400, "Bad Request", [], b"")
             return
 
-        writer.write(websocket_handshake(key))
-        await writer.drain()
+        # Claim the single viewer slot before the first await. Otherwise a second
+        # upgrade that arrives while this handshake is being flushed could pass the
+        # check above too, and two viewers would be connected at once.
         self._viewer = writer
-        self.on_viewer(True)
-        self._send_text(writer, {"t": "hello", **self._safe_stats()})
-        sender = asyncio.create_task(self._send_frames(writer))
-        stats = asyncio.create_task(self._send_stats(writer))
+        announced = False
+        sender = stats = None
         try:
+            writer.write(websocket_handshake(key))
+            await writer.drain()
+            announced = True
+            self.on_viewer(True)
+            self._send_text(writer, {"t": "hello", **self._safe_stats()})
+            sender = asyncio.create_task(self._send_frames(writer))
+            stats = asyncio.create_task(self._send_stats(writer))
             while True:
                 opcode, payload = await read_ws_frame(reader)
                 if opcode == OP_CLOSE:
@@ -250,11 +256,13 @@ class RemoteServer:
                 elif opcode == OP_PONG:
                     continue
         finally:
-            sender.cancel()
-            stats.cancel()
+            for task in (sender, stats):
+                if task is not None:
+                    task.cancel()
             if self._viewer is writer:
                 self._viewer = None
-                self.on_viewer(False)
+                if announced:
+                    self.on_viewer(False)
             try:
                 writer.write(ws_frame(OP_CLOSE, struct.pack("!H", 1000)))
             except (OSError, RuntimeError):
