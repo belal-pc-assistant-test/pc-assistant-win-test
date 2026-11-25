@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import base64
+import io
 import platform
 import shutil
 import socket
@@ -29,7 +30,7 @@ from .base import (
     truncate,
     windows_only,
 )
-from .core import take_screenshot, _screenshot_destination
+from .core import encode_photo
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +408,10 @@ def volume(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     config = ctx.config
     started = time.perf_counter()
 
-    mode = (params.get("mode") or "toggle").strip().lower()
-    if mode not in VOLUME_MODES:
-        raise ActionError(f"'mode' must be one of {sorted(VOLUME_MODES)} (got {mode!r}).")
+    # No silent fallback: only an explicitly requested mode may touch the
+    # volume. A numeric "level" implies mode "set"; without either, nothing
+    # happens and the step fails with a clear error.
+    mode = (params.get("mode") or "").strip().lower()
 
     level: int | None = None
     if "level" in params and params["level"].strip():
@@ -419,8 +421,22 @@ def volume(params: dict[str, str], ctx: ActionContext) -> ActionResult:
         if not 0 <= level <= 100:
             raise ActionError("'level' must be between 0 and 100.")
         mode = "set"
+
+    if not mode:
+        raise ActionError(
+            "'mode' is required for volume — one of "
+            + ", ".join(sorted(VOLUME_MODES)) + " (or a numeric 'level'). "
+            "Nothing was changed."
+        )
+    if mode not in VOLUME_MODES:
+        raise ActionError(
+            f"'mode' must be one of {sorted(VOLUME_MODES)} (got {mode!r}). "
+            "Nothing was changed."
+        )
     if mode == "set" and level is None:
-        raise ActionError("Mode 'set' needs a 'level' between 0 and 100.")
+        raise ActionError(
+            "Mode 'set' needs a 'level' between 0 and 100. Nothing was changed."
+        )
 
     try:
         steps = int(params.get("steps") or 5)
@@ -581,71 +597,66 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms
 $sig = @'
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
 public struct RECT { public int Left, Top, Right, Bottom; }
 '@
 $w = Add-Type -MemberDefinition $sig -Name 'WinApi' -Namespace 'TpaWin' -PassThru
-$title = @'
-{title}
-'@
+$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{title}'))
 $handle = [IntPtr]::Zero
 if ($title.Trim().Length -gt 0) {
-  $p = Get-Process | Where-Object { $_.MainWindowTitle -like "*$($title.Trim())*" } |
+  $p = Get-Process | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle.IndexOf($title, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } |
        Select-Object -First 1
   if (-not $p) { Write-Error "No window matching '$title'"; exit 2 }
   $handle = $p.MainWindowHandle
-  $null = $w::SetForegroundWindow($handle)
-  Start-Sleep -Milliseconds 400
 } else {
-  $handle = $w::GetForegroundWindow()
+  $handle = [IntPtr]::new([Int64]'{handle}')
+  if ($handle -eq [IntPtr]::Zero) { Write-Error 'No active window available'; exit 4 }
 }
 $rect = New-Object TpaWin.WinApi+RECT
 $null = $w::GetWindowRect($handle, [ref]$rect)
 $width = $rect.Right - $rect.Left
 $height = $rect.Bottom - $rect.Top
-if ($width -le 0 -or $height -le 0) { Write-Error 'Could not measure the window'; exit 3 }
+if ($width -le 0 -or $height -le 0 -or $width -gt 12000 -or $height -gt 12000) { Write-Error 'Could not measure the window'; exit 3 }
 $bmp = New-Object System.Drawing.Bitmap $width, $height
 $g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
-$bmp.Save('{out}', [System.Drawing.Imaging.ImageFormat]::Png)
-$g.Dispose(); $bmp.Dispose()
-'ok'
+$hdc = $g.GetHdc()
+try { $ok = $w::PrintWindow($handle, $hdc, 2) } finally { $g.ReleaseHdc($hdc) }
+if (-not $ok) { Write-Error 'This window cannot be captured'; exit 5 }
+$mem = New-Object System.IO.MemoryStream
+$bmp.Save($mem, [System.Drawing.Imaging.ImageFormat]::Png)
+[Convert]::ToBase64String($mem.ToArray())
+$mem.Dispose(); $g.Dispose(); $bmp.Dispose()
 """
 
 
 def window_screenshot(params: dict[str, str], ctx: ActionContext) -> ActionResult:
-    started = time.perf_counter()
-    config = ctx.config
-    title = (params.get("title") or "").strip()
-
+    if not ctx.capture_allowed:
+        raise ActionError("Window capture requires approval and a visible sharing indicator.")
+    if params.get("path"):
+        raise ActionError("Saving screenshots to disk is disabled. Request a photo instead.")
     if not IS_WINDOWS:
         raise windows_only("Window screenshots")
-
-    out = _screenshot_destination(config, params.get("path"))
-    out.parent.mkdir(parents=True, exist_ok=True)
-    script = (WINDOW_SHOT_PS
-              .replace("{title}", title.replace("'", "''"))
-              .replace("{out}", str(out).replace("'", "''")))
-    proc = run_powershell(script, min(config.command_timeout, 45), config.workspace_root)
-
-    if proc.returncode != 0 or not out.exists():
-        # Never fail a screenshot request completely: fall back to the full screen.
-        fallback = take_screenshot({"path": str(out)}, ctx)
-        fallback.action = "window_screenshot"
-        fallback.output = (
-            "Could not capture a single window, sent the full screen instead.\n"
-            f"{fallback.output}"
-        )
-        return fallback
-
-    return ActionResult(
-        "window_screenshot", True,
-        f"Window screenshot saved: {out} ({out.stat().st_size / 1024:.0f} KB)"
-        + (f" — window matching '{title}'" if title else " — active window"),
-        files=[out],
-        files_as_document=config.screenshot_as_document,
-        duration=time.perf_counter() - started,
-    )
+    started = time.perf_counter()
+    title = (params.get("title") or "").strip()
+    title64 = base64.b64encode(title.encode("utf-8")).decode("ascii")
+    proc = run_powershell(WINDOW_SHOT_PS.replace("{title}", title64).replace("{handle}", str(ctx.capture_window_handle)),
+                          min(ctx.config.command_timeout, 45), ctx.config.workspace_root)
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        # Never fall back to the whole screen: that could expose extra data.
+        raise ActionError("Window capture failed or no matching window was found; no full-screen fallback was taken.")
+    try:
+        encoded = ''.join(proc.stdout.split())
+        if len(encoded) > 30_000_000:
+            raise ValueError("image too large")
+        png = base64.b64decode(encoded, validate=True)
+        from PIL import Image
+        with Image.open(io.BytesIO(png)) as image:
+            photo = encode_photo(image)
+    except Exception as exc:
+        raise ActionError("Could not decode the window capture.") from exc
+    return ActionResult("window_screenshot", True,
+                        "Window photo captured in memory" + (f" (title: {title})" if title else " (active window)"),
+                        photo=photo, duration=time.perf_counter() - started)
 
 
 # ---------------------------------------------------------------------------

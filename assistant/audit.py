@@ -67,6 +67,24 @@ def setup(log_file: Path, level: str = "INFO") -> None:
     _configured = True
 
 
+def close() -> None:
+    """Flush and close every log handler and allow re-configuration later.
+
+    Windows keeps deleted-but-open files locked (WinError 32), so the bot
+    calls this on shutdown and tests call it in ``tearDown`` before removing
+    the temporary log folder.
+    """
+    global _configured
+    for handler in tuple(_LOGGER.handlers):
+        try:
+            handler.flush()
+            handler.close()
+        except Exception:  # never fail shutdown because of logging
+            pass
+        _LOGGER.removeHandler(handler)
+    _configured = False
+
+
 # Audit metadata only: never store requests, transcripts, notes, commands,
 # output, exception text, paths or other potentially secret-bearing content.
 _SAFE_FIELDS = {'user_id', 'chat_id', 'step', 'ok', 'duration', 'failed', 'aborted', 'killed', 'jobs'}

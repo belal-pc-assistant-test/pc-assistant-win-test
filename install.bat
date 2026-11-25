@@ -35,7 +35,7 @@ if exist "config.ini" (
     echo [4/6] config.ini already exists - left untouched.
 ) else (
     copy /y "config.example.ini" "config.ini" >nul
-    echo [4/6] Created config.ini (allowed user id: 7823157087).
+    echo [4/6] Created config.ini ^(allowed user id: 7823157087^).
 )
 
 echo [5/6] Running self check ...
@@ -52,8 +52,11 @@ if exist "token.txt" (
 )
 echo   Optional: save the token in the per-user store instead of token.txt.
 echo   You can also skip this and enter it at first startup.
-choice /c YN /n /m "Save your bot token now? [Y/N] "
-if errorlevel 2 goto skip_token
+set "SAVE_TOKEN="
+rem An interactive read via set /p: on EOF (closed stdin) it simply
+rem continues, so this installer never hangs in non-interactive runs.
+set /p "SAVE_TOKEN=Save your bot token now? [y/N] "
+if /i not "%SAVE_TOKEN%"=="Y" goto skip_token
 ".venv\Scripts\python.exe" main.py --set-token
 goto after_token
 

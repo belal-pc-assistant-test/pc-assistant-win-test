@@ -233,7 +233,6 @@ def self_check(config: Config) -> int:
     print("\n[3] Folders")
     for label, path in (
         ("log folder", config.log_dir),
-        ("screenshots folder", config.screenshots_dir),
         ("downloads folder", config.downloads_dir),
         ("jobs folder", config.jobs_file.parent),
     ):
@@ -361,13 +360,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     audit.setup(config.log_file, config.log_level)
-    config.screenshots_dir.mkdir(parents=True, exist_ok=True)
 
     if args.check:
-        return self_check(config)
+        result = self_check(config)
+        audit.close()  # release the log file (Windows locks open files)
+        return result
 
     if args.plan:
-        return dry_run(config, args.plan)
+        result = dry_run(config, args.plan)
+        audit.close()
+        return result
 
     # Normal start — first run asks for the token with hidden input.
     if not ensure_token(config, allow_prompt=not args.no_token_prompt):
@@ -421,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         audit.event("shutdown")
+        audit.close()
     return 0
 
 

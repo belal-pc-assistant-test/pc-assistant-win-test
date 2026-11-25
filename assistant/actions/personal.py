@@ -99,3 +99,7 @@ def reminder_delivery(params: dict[str, str], ctx: ActionContext) -> ActionResul
 
 def cloud_plan(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     raise ActionError('Cloud planning requires the Telegram confirmation flow.')
+
+
+def watch_action(params: dict[str, str], ctx: ActionContext) -> ActionResult:
+    raise ActionError('Screen sharing requires the Telegram approval and indicator flow.')

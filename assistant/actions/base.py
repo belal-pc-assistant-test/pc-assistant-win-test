@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol, runtime_checkable
 
-from ..config import Config
+from ..config import Config, normalize_path, path_is_inside
 
 IS_WINDOWS = os.name == "nt"
 
@@ -35,6 +35,7 @@ class ActionResult:
     files: list[Path] = field(default_factory=list)
     files_as_document: bool = True
     duration: float = 0.0
+    photo: bytes | None = None  # in-memory screenshot; never written to disk
 
     @property
     def has_files(self) -> bool:
@@ -57,6 +58,8 @@ class ActionContext:
     transport: Transport | None = None
     jobs: Any = None          # assistant.jobs.JobStore (set by the bot)
     chat_id: int | None = None
+    capture_allowed: bool = False  # set only after approval + visible indicator
+    capture_window_handle: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -135,22 +138,27 @@ def effective_roots(config: Config) -> list[Path]:
     """Folders that file actions may touch.
 
     ``[paths] allowed_roots`` when set, otherwise the working folder. File
-    transfer actions always stay inside these folders.
+    transfer actions always stay inside these folders. Every root is
+    returned in normalized form (see :func:`normalize_path`) so checks and
+    reported paths never mix short/long or differently-cased spellings.
     """
-    return list(config.allowed_roots) or [config.workspace_root]
+    roots = list(config.allowed_roots) or [config.workspace_root]
+    return [normalize_path(root) for root in roots]
 
 
 def ensure_inside(path: Path, roots: Iterable[Path], what: str = "Path") -> Path:
+    """Return ``path`` in normalized form once it sits inside one of ``roots``.
+
+    Both sides go through :func:`normalize_path`, so an 8.3 short-form root
+    (``C:\\Users\\RUNNER~1\\…``) accepts the long-form path of the very same
+    folder (``C:\\Users\\runneradmin\\…``) on Windows.
+    """
+    normalized = normalize_path(path)
     for root in roots:
-        try:
-            path.relative_to(root)
-            return path
-        except ValueError:
-            continue
-    raise ActionError(
-        f"{what} is outside the allowed folders "
-        f"({', '.join(str(r) for r in roots)}): {path}"
-    )
+        if path_is_inside(normalized, normalize_path(root)):
+            return normalized
+    pretty = ", ".join(str(normalize_path(root)) for root in roots)
+    raise ActionError(f"{what} is outside the allowed folders ({pretty}): {normalized}")
 
 
 def resolve_path(raw: str, config: Config, what: str = "Path") -> Path:
@@ -161,7 +169,7 @@ def resolve_path(raw: str, config: Config, what: str = "Path") -> Path:
     path = Path(cleaned)
     if not path.is_absolute() and not WINDOWS_PATH_RE.match(cleaned):
         path = config.workspace_root / path
-    path = path.resolve()
+    path = normalize_path(path)
     if config.allowed_roots:
         ensure_inside(path, config.allowed_roots, what)
     return path
@@ -170,14 +178,13 @@ def resolve_path(raw: str, config: Config, what: str = "Path") -> Path:
 def resolve_in_roots(raw: str, config: Config, what: str = "Path") -> Path:
     """Like :func:`resolve_path`, but always confined to the effective roots."""
     cleaned = expand(raw)
+    roots = effective_roots(config)
     if not cleaned:
-        base = effective_roots(config)[0]
-        return base.resolve()
+        return roots[0]
     path = Path(cleaned)
     if not path.is_absolute() and not WINDOWS_PATH_RE.match(cleaned):
-        base = effective_roots(config)[0]
-        path = base / path
-    return ensure_inside(path.resolve(), [p.resolve() for p in effective_roots(config)], what)
+        path = roots[0] / path
+    return ensure_inside(path, roots, what)
 
 
 def sanitize_filename(name: str, fallback: str = "download.bin") -> str:

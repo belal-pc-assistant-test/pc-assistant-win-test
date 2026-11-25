@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from ..config import normalize_path
 from .base import (
     ActionContext,
     ActionError,
@@ -92,11 +93,11 @@ def receive_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
                 f"max_send_file_mb ({config.max_send_file_mb} MB)."
             )
 
-    roots = [p.resolve() for p in effective_roots(config)]
+    roots = [normalize_path(p) for p in effective_roots(config)]
     if (params.get("target") or "").strip():
         destination = resolve_in_roots(params["target"], config, "Destination")
     else:
-        folder = config.downloads_dir.resolve()
+        folder = normalize_path(config.downloads_dir)
         ensure_inside(folder, roots, "Downloads folder")
         folder.mkdir(parents=True, exist_ok=True)
         destination = unique_destination(folder, sanitize_filename(params.get("file_name", "")))
@@ -163,7 +164,7 @@ def find_files(params: dict[str, str], ctx: ActionContext) -> ActionResult:
     config = ctx.config
     started = time.perf_counter()
 
-    roots = [p.resolve() for p in effective_roots(config)]
+    roots = [normalize_path(p) for p in effective_roots(config)]
     root_param = (params.get("root") or "").strip()
     root = resolve_in_roots(root_param, config, "Search folder") if root_param else roots[0]
     if not root.is_dir():

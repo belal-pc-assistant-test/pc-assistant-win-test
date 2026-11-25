@@ -62,8 +62,9 @@ Both users can request actions, but only configured approvers can approve; with 
 | `system_info`, `list_processes` | System report; processes by CPU, memory or name |
 | `kill_process` | Stop by PID or name; critical and configured protected names, PID ≤ 4, and assistant/parent PID are refused (best-effort process-name check) |
 | `open`, `open_url` | Open a target or an HTTP(S) URL; `open` can launch programs |
-| `screenshot`, `window_screenshot` | Send a PNG; if window capture fails on Windows it may fall back to **the full screen** |
-| `lock_screen`, `notification`, `volume` | Lock, desktop notification, or volume key presses; mute/unmute are toggles, not state-aware |
+| `screenshot`, `window_screenshot` | Approved JPEG photo with visible indicator; window capture never falls back to the full screen |
+| `watch_start`, `watch_speed` | Approved visible full-screen sharing session or interval change |
+| `lock_screen`, `notification`, `volume` | Lock, desktop notification, or volume key presses; volume needs an explicit mode (`mute`/`unmute`/`toggle`/`up`/`down`/`set`) or a numeric `level` — unknown or missing modes change nothing |
 | `clipboard_get`, `clipboard_set` | Read or replace clipboard text |
 | `read_file`, `write_file`, `list_dir` | Read/write text or list a folder; writes can overwrite |
 | `find_files`, `send_file`, `receive_file` | Search, send a file to Telegram, or save an uploaded document after approval; confined to configured roots |
@@ -80,6 +81,9 @@ Windows-specific actions need Windows and a usable desktop session. File transfe
 
 | Command | What it does |
 |---|---|
+| `/screen`, `/window [title]` | Propose one full-screen or window-only JPEG photo; approve each capture. Without a title the foreground window at capture time is used. |
+| `/watch start [seconds] [minutes]` | Propose a temporary full-desktop sharing session; default 3 seconds and 10 minutes. |
+| `/watch speed N`, `/watch stop` | Propose an interval change (2–60 seconds) or stop immediately without approval. |
 | `/note TEXT` | Propose adding a note. Approve to save it locally. |
 | `/notes` | Propose sending your saved numbered notes to this chat. |
 | `/forget N` | Propose deleting note number N; checks it has not changed. `/forget language` removes the preference; `/forget all` removes notes, macros and preferences (not jobs). |
@@ -94,6 +98,12 @@ Windows-specific actions need Windows and a usable desktop session. File transfe
 | `/yes CODE`, `/no CODE`, `/approve CODE`, `/deny CODE` | Approve/deny a pending plan; plain `approve CODE`, `deny CODE`, `موافق CODE` and `رفض CODE` work too. |
 
 Plans expire after 15 minutes; deny or expiry means a due one-time reminder or command is not delivered/run and is not retried automatically. A due daily job waits if another plan from that requester is pending; missed daily occurrences are not replayed in a flood. `/panic` prevents queueing while active. Briefing/job schedules live only in the assistant, not Windows Task Scheduler; the bot must run for them to be queued.
+
+### Visible screen sharing
+
+`/screen` and `/window [title]` each produce a plan; approve with Yes or `approve CODE` before any capture. A title is matched case-insensitively; without one the foreground window is selected immediately before showing the indicator. Ambiguous titles select the first match. Some windows block capture or produce blank images; no full-screen fallback is attempted. A visible red topmost indicator is required during capture and upload, including one-shot photos. Its local **Stop screen sharing** button ends the operation.
+
+`/watch start [seconds] [minutes]` proposes sharing the full desktop, including all visible screens. Defaults are **3 seconds and 10 minutes**; bounds are 2–60 seconds and 1–60 minutes. Approve once to start. The assistant sends a start notice, a photo, then updates that message with resized JPEG frames (maximum width 1280). `/watch speed N` proposes an approved change; `/watch stop` or `/panic` cancels immediately. A stop notice is sent when possible. Frames are sequential: slow uploads skip missed frames, Telegram rate-limit responses cause backoff, and failed edits can fall back to a fresh photo no more than once every 30 seconds. Network errors may prevent notices or updates. If the indicator closes, disappears, or stops reporting visibility, sharing stops; local GUI scheduling and heartbeat detection are best effort, not a tamper-proof guarantee. The remote stop cancels in-progress work, but an upload already sent to Telegram may still arrive and cannot be recalled. Telegram itself can retain photos and message history. No screenshot file is created; in-memory buffers are discarded after use. Capture requires a private chat whose ID equals the allowed requesting user ID. This feature uses no keylogger, webcam, or microphone. The separately optional voice-note feature accepts audio users deliberately send through Telegram; it does not activate the PC microphone.
 
 ### Optional local voice notes
 
@@ -131,23 +141,25 @@ From a console in the project folder:
 | `[behaviour] max_plan_steps`, `command_timeout`, `max_output_chars`, `max_file_read_kb` | Step and output limits |
 | `[behaviour] max_send_file_mb`, `protected_processes`, `blocked_patterns` | Transfer cap and extra guardrails |
 | `[paths] workspace_root`, `allowed_roots` | Working directory and optional roots for ordinary file operations. If roots are empty, **transfer/search actions** still default to workspace root; ordinary file actions are unrestricted. PowerShell and `open` are not confined. |
-| `[paths] downloads_dir`, `screenshots_dir`, `keep_screenshots` | File locations and screenshot retention. `downloads_dir` must lie within allowed roots (or workspace root if roots are empty). |
+| `[paths] downloads_dir` | Uploaded files location; must lie within allowed roots (or workspace root if roots are empty). Legacy screenshot-path settings are ignored for screen photos. |
 | `[paths] jobs_file`, `log_file` | Persistent jobs and metadata-only audit log. Memory is `memory.json` next to the jobs file. These files are not tamper-proof; restrict OS permissions. |
 | `[voice] model_path` | Local faster-whisper model directory; no automatic model download. |
 
-Scheduled jobs use the PC's local time and are checked about every 15 seconds while the program runs. Missed jobs can be queued after restart, but always need a new approval. Someone with write access to local job/memory files can alter what is proposed; review the exact plan, and protect these files from other users. The audit log rotates; screenshots may remain on disk if `keep_screenshots = true`.
+Scheduled jobs use the PC's local time and are checked about every 15 seconds while the program runs. Missed jobs can be queued after restart, but always need a new approval. Someone with write access to local job/memory files can alter what is proposed; review the exact plan, and protect these files from other users. The audit log rotates. Screen photos are held in memory, not saved as screenshot files; Telegram retains sent photos according to its own policies.
 
 ## Troubleshooting & limitations
 
 * `python` not found: reinstall Python with PATH enabled; open a new console.
 * Bot silent: check IDs and token, start a private chat, and ensure only one bot instance is polling. Revoke a leaked token with BotFather and run `set_token.bat`.
 * Cloud throttled or down: the bot attempts its configured fallback; wait or choose local/keywords. Ollama must be installed and the named model pulled.
-* Screenshot black or GUI action fails: unlock the machine and use an interactive desktop session. Window fallback can capture more than the requested window.
+* Screenshot black or GUI action fails: unlock the machine and use an interactive desktop session. Some protected, minimized or hardware-accelerated windows may be black or fail; no full-screen fallback is used.
 * Approver not receiving the plan: they must start the bot first, and their numeric ID must match `approver_user_ids`.
 * Check `logs\assistant.log`, `/status`, and `check_setup.bat`; current logs are metadata-only, but old logs may contain sensitive information.
 * Voice setup fails: check that the optional package and local model were installed in this project; install the pinned PyAV dependency from `requirements-voice.txt`. Some machines or Python versions may not have compatible wheels.
+* "outside the allowed folders" for a folder you did allow: make sure the path exists; every configured root and requested path is normalized the same way (symlinks, Windows 8.3 short names like `C:\Users\RUNNER~1\…` vs `C:\Users\runneradmin\…`, and case differences on Windows), so both spellings of the same folder are accepted.
+* Garbled console output or `UnicodeEncodeError` on Windows: entry points reconfigure stdout/stderr to UTF-8 with `errors=replace`; the installers also run `chcp 65001`.
 
-The offline automated tests exercise planner validation, mocked networking, approval flow and action safety. Windows APIs, DPAPI, GUI interaction and real Telegram end-to-end behavior require testing on the target Windows PC; these cannot be guaranteed by the offline tests.
+The offline automated tests exercise planner validation, mocked networking, approval flow, action safety, the .bat launchers' cmd block rules and Windows path/encoding handling. Windows APIs, DPAPI, GUI interaction and real Telegram end-to-end behavior require testing on the target Windows PC; these cannot be guaranteed by the offline tests.
 
 To uninstall, run `main.py --forget-token` before deleting the project (and remove `token.txt` yourself), remove any startup shortcut, remove `%APPDATA%\TelegramPCAssistant` if desired, and delete/revoke the bot in BotFather.
 

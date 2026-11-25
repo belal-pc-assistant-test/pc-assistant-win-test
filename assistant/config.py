@@ -73,12 +73,98 @@ def _get_str(section: configparser.SectionProxy, key: str, default: str) -> str:
     return raw.strip()
 
 
+IS_WINDOWS = os.name == "nt"
+
+
+def _expand_short_names(path: Path) -> Path:
+    """Windows only: expand 8.3 short names (``RUNNER~1``) to their long form.
+
+    ``Path.resolve()`` follows symlinks/junctions but can still leave 8.3
+    short-name components in place, and ``GetLongPathNameW`` only works for
+    paths that exist, so walk up to the deepest existing ancestor and
+    re-attach the remaining tail.
+    """
+    if not IS_WINDOWS:
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        get_long = ctypes.windll.kernel32.GetLongPathNameW
+        get_long.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        get_long.restype = wintypes.DWORD
+    except Exception:  # non-Windows build or stripped environment
+        return path
+
+    probe = path
+    tail: list[str] = []
+    while True:
+        size = 260
+        n = 0
+        while True:
+            buf = ctypes.create_unicode_buffer(size)
+            n = get_long(str(probe), buf, size)
+            if n == 0:          # does not exist (yet) or no mapping
+                break
+            if n <= size:       # buffer was large enough
+                break
+            size = n            # retry with the size the API asked for
+        if n:
+            expanded = Path(buf.value[:n])
+            for part in reversed(tail):
+                expanded = expanded / part
+            return expanded
+        if probe.parent == probe:  # reached the drive root
+            return path
+        tail.append(probe.name)
+        probe = probe.parent
+
+
+def normalize_path(path: str | os.PathLike) -> Path:
+    """The one canonical form used whenever paths are compared or reported.
+
+    Everything that participates in an allow-list check — configured roots,
+    requested paths, download folders — must go through this same function.
+    ``Path.resolve`` alone is not enough on Windows: ``C:\\Users\\RUNNER~1\\…``
+    and ``C:\\Users\\runneradmin\\…`` are the same folder, but ``resolve()``
+    may keep the short form, which made allow-list checks fail spuriously.
+    """
+    try:
+        resolved = Path(path).resolve(strict=False)
+    except OSError:  # very long or exotic names
+        resolved = Path(os.path.abspath(path))
+    if IS_WINDOWS:
+        resolved = _expand_short_names(resolved)
+    return resolved
+
+
+def path_is_inside(path: Path, root: Path) -> bool:
+    """True when ``path`` is ``root`` itself or below it.
+
+    Path comparison is flavour-aware: ``PureWindowsPath`` compares
+    case-insensitively, POSIX paths case-sensitively. Prefix matches are
+    boundary-checked by ``relative_to`` (``C:\\allowedx`` is not inside
+    ``C:\\allowed``).
+    """
+    from pathlib import PurePath
+
+    if not isinstance(path, PurePath):
+        path = Path(path)
+    if not isinstance(root, PurePath):
+        root = Path(root)
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def _resolve_dir(raw: str, base: Path) -> Path:
     """Resolve a config path; relative paths are relative to the project folder."""
     path = Path(os.path.expandvars(os.path.expanduser(raw.strip())))
     if not path.is_absolute():
         path = base / path
-    return path.resolve()
+    return normalize_path(path)
 
 
 @dataclass

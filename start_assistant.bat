@@ -13,7 +13,7 @@ if not exist ".venv\Scripts\python.exe" (
 
 if not exist "config.ini" (
     echo [X] config.ini is missing.
-    echo     Copy config.example.ini to config.ini (install.bat does this).
+    echo     Copy config.example.ini to config.ini ^(install.bat does this^).
     echo.
     pause
     exit /b 1

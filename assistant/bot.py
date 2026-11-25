@@ -57,6 +57,8 @@ from .plan_code import fingerprint, normalize_code, unique_code
 from .scheduler import scheduler_loop
 from .memory import MemoryStore, language_for, NAME_RE
 from .voice import transcribe, VoiceUnavailable, MAX_VOICE_BYTES, MAX_VOICE_SECONDS
+from .sharing import (ScreenIndicator, WatchController, CaptureLease, capture_frame, photo_stream, foreground_window_handle,
+                      MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL, DEFAULT_MINUTES, MAX_MINUTES)
 from .planner import build_plan, PlannerError
 
 MAX_TG_LEN = 4000
@@ -98,6 +100,10 @@ MSG = {
         "/yes CODE /no CODE – approve or deny; /approve and /deny are aliases\n"
         "/panic – cancel ALL pending plans and abort running ones\n"
         "/logs – last lines of the local audit log (approval required)\n"
+        "/screen – full-screen photo; /window [title] – window photo (approval required)\n"
+        "/watch start [seconds] [minutes] – visible screen sharing; /watch speed N – change speed with approval\n"
+        "/watch stop – stop immediately; default 3s/10min, min 2s, max 60min\n"
+        "A visible indicator is required; photos are sent only to allowed private chats.\n"
         "/note TEXT – save a note; /notes – view notes; /forget N|language|all – forget memory\n"
         "/language en|ar – save a language preference\n"
         "/briefing now – request a briefing; /briefing daily HH:MM – schedule daily approval requests\n"
@@ -147,6 +153,7 @@ class PendingPlan:
     chat_id: int
     plan: Plan
     created_at: float
+    watch_epoch: int = 0
     message_refs: list[tuple[int, int]] = field(default_factory=list)
 
 
@@ -215,8 +222,10 @@ _FRIENDLY = {
     "cloud_plan": ("Send the displayed request and context to the external planning service; you will review a second plan afterward.", "سيتم إرسال الطلب والسياق المعروضين للخدمة الخارجية، ثم ستراجع خطة ثانية."),
     "write_file": ("Write the displayed content to the file; it may overwrite it.", "سيتم كتابة المحتوى المعروض وقد يُستبدل الملف."),
     "send_file": ("Send the specified file to Telegram.", "سيتم إرسال الملف المحدد إلى تيليجرام."),
-    "screenshot": ("Capture the screen and send the image to Telegram.", "سيتم التقاط الشاشة وإرسال الصورة إلى تيليجرام."),
-    "window_screenshot": ("Capture a window; fallback can capture the full screen.", "سيتم تصوير نافذة وقد تُلتقط الشاشة كاملة عند تعذر ذلك."),
+    "screenshot": ("Capture the full screen and send the photo with a visible indicator.", "سيتم التقاط الشاشة وإرسال الصورة إلى تيليجرام مع إظهار مؤشر واضح."),
+    "window_screenshot": ("Capture the requested window only; no full-screen fallback. A visible indicator is required.", "سيتم تصوير النافذة فقط مع إظهار مؤشر واضح، دون التقاط الشاشة كاملة عند الفشل."),
+    "watch_start": ("Start visible, temporary full-screen sharing to this private chat until stopped or timed out.", "ستبدأ مشاركة الشاشة كاملة بشكل واضح ومؤقت إلى هذه المحادثة حتى الإيقاف أو انتهاء المدة."),
+    "watch_speed": ("Change the interval of the existing visible sharing session.", "سيتم تغيير مدة التحديث لجلسة المشاركة الحالية المرئية."),
     "open": ("Open the specified target on the PC.", "سيتم فتح العنصر المحدد على الجهاز."),
     "open_url": ("Open the URL in a browser.", "سيتم فتح الرابط في المتصفح."),
     "power": ("Change the PC power state; data loss is possible.", "سيتم تغيير حالة طاقة الجهاز وقد تُفقد بيانات غير محفوظة."),
@@ -568,6 +577,13 @@ async def cmd_panic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.application.bot_data["panic_epoch"] = context.application.bot_data.get("panic_epoch", 0) + 1
     running_before = REGISTRY.running
     request_abort()  # act before network waits
+    context.application.bot_data["watch_epoch"] = context.application.bot_data.get("watch_epoch", 0) + 1
+    controller = context.application.bot_data.get("watch_controller")
+    if controller is not None:
+        controller.stop_now("panic")
+    lease = context.application.bot_data.get("screen_capture_lease")
+    if lease is not None:
+        lease.stop_now()
     for pending in cancelled:
         await _mark_messages(
             context, pending,
@@ -754,6 +770,8 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          or re.search(r'[\u0600-\u06ff]', current_text) else fallback)
 
     panic_epoch = context.application.bot_data.get("panic_epoch", 0)
+    watch_epoch = context.application.bot_data.get("watch_epoch", 0)
+    watch_plan = any(s.action in {"watch_start", "watch_speed"} for s in plan.steps)
     versions = context.application.bot_data.setdefault("proposal_versions", {})
     proposal_key = (user.id, chat_id)
     version = versions.get(proposal_key, 0) + 1
@@ -769,7 +787,8 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
     if (context.application.bot_data.get("panic_epoch", 0) != panic_epoch or
-            versions.get(proposal_key) != version):
+            versions.get(proposal_key) != version or
+            (watch_plan and context.application.bot_data.get("watch_epoch", 0) != watch_epoch)):
         return None
     code = unique_code([p.code for p in store.values()])
     pending = PendingPlan(
@@ -780,6 +799,7 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
         chat_id=chat_id,
         plan=plan,
         created_at=time.time(),
+        watch_epoch=watch_epoch,
     )
     store[pending.plan_id] = pending
 
@@ -826,7 +846,8 @@ async def propose_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           error=str(exc))
 
     if (context.application.bot_data.get("panic_epoch", 0) != panic_epoch or
-            versions.get(proposal_key) != version or store.get(pending.plan_id) is not pending):
+            versions.get(proposal_key) != version or store.get(pending.plan_id) is not pending or
+            (watch_plan and context.application.bot_data.get("watch_epoch", 0) != watch_epoch)):
         store.pop(pending.plan_id, None)
         await _mark_messages(context, pending, "🛑 Cancelled by /panic or a newer request.")
         return None
@@ -1083,6 +1104,13 @@ async def _execute_claimed_plan(update: Update, context: ContextTypes.DEFAULT_TY
                         result = ActionResult("cloud_plan", True, "Planning finished. Review the next plan before any PC action.")
                 except Exception:
                     result = ActionResult("cloud_plan", False, "External planning failed.")
+        elif step.action in {"screenshot", "window_screenshot"}:
+            result = await _run_visible_screenshot(step, pending, context, config, transport, jobs)
+        elif step.action in {"watch_start", "watch_speed"}:
+            if pending.watch_epoch != context.application.bot_data.get("watch_epoch", 0):
+                result = ActionResult(step.action, False, "Sharing was stopped after this plan was proposed.")
+            else:
+                result = await _run_watch_action(step, pending, context, config)
         else:
             result = await asyncio.to_thread(execute_step, step, config, transport, jobs, chat_id)
         audit.event("action_result", user_id=approved_by, code=pending.code, step=index,
@@ -1150,11 +1178,13 @@ async def _send_file(bot: Any, chat_id: int, path: Path, as_document: bool,
         await send_long(bot, chat_id, f"⚠️ Could not attach {_esc(str(path))}: {_esc(str(exc))}",
                         parse_mode=ParseMode.HTML)
         return
-    if is_screenshot and not config.keep_screenshots:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    finally:
+        # Legacy defensive cleanup: screenshot actions now use memory only.
+        if is_screenshot:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1414,6 +1444,161 @@ async def queue_briefing(application, job):
 
 
 
+def _watch_controller(context, config):
+    data = context.application.bot_data
+    if 'watch_controller' not in data:
+        data['watch_controller'] = WatchController(context.bot, config)
+    return data['watch_controller']
+
+
+async def _run_watch_action(step, pending, context, config):
+    if pending.chat_id != pending.requester_id or not config.is_allowed(pending.requester_id):
+        return ActionResult(step.action, False, 'Sharing is restricted to an allowed private chat.')
+    controller = _watch_controller(context, config)
+    try:
+        seconds = int(step.params.get('seconds', ''))
+        if step.action == 'watch_start':
+            minutes = int(step.params.get('minutes', ''))
+            ok, message = await controller.start(pending.requester_id, pending.chat_id, seconds, minutes)
+        else:
+            ok, message = controller.speed(pending.requester_id, step.params.get('session', ''), seconds)
+    except (ValueError, TypeError):
+        return ActionResult(step.action, False, 'Invalid sharing interval or duration.')
+    return ActionResult(step.action, ok, message)
+
+
+async def _run_visible_screenshot(step, pending, context, config, transport, jobs):
+    if pending.chat_id != pending.requester_id or not config.is_allowed(pending.requester_id):
+        return ActionResult(step.action, False, 'Screen photos are restricted to an allowed private chat.')
+    if step.params.get('path'):
+        return ActionResult(step.action, False, 'Saving screenshots to disk is disabled; request a photo instead.')
+    if abort_requested():
+        return ActionResult(step.action, False, 'Aborted by /panic.')
+    window_handle = foreground_window_handle() if step.action == 'window_screenshot' else 0
+    lease = CaptureLease()
+    lease.task = asyncio.current_task()
+    context.application.bot_data['screen_capture_lease'] = lease
+    monitor = None
+    try:
+        lease.indicator = await ScreenIndicator.open()
+        if lease.stopping or not lease.indicator.visible() or abort_requested():
+            return ActionResult(step.action, False, 'Visible indicator unavailable; no screen capture was taken.')
+        monitor = asyncio.create_task(lease.monitor())
+        if step.action == 'screenshot':
+            data = await asyncio.wait_for(capture_frame(lease, 2560, 84), 45)
+        else:
+            data = await asyncio.wait_for(capture_frame(lease, 2560, 84,
+                                          step.params.get('title', '').strip(), window_handle), 45)
+        result = ActionResult(step.action, True, 'Approved photo captured in memory.', photo=data)
+        del data
+        if lease.stopping or abort_requested() or not lease.indicator.visible():
+            return ActionResult(step.action, False, 'Capture discarded because sharing stopped or the indicator closed.')
+        if not result.ok or result.photo is None:
+            return result
+        if not config.is_allowed(pending.requester_id):
+            return ActionResult(step.action, False, 'The requester is no longer allowed; photo discarded.')
+        stream = photo_stream(result.photo)
+        try:
+            await context.bot.send_photo(chat_id=pending.chat_id, photo=stream,
+                                         caption='📸 Approved screen photo' if step.action == 'screenshot'
+                                         else '🪟 Approved window photo')
+        except Exception:
+            return ActionResult(step.action, False, 'Could not send the screen photo; it was discarded.')
+        finally:
+            stream.close()
+            result.photo = None
+        return result
+    except asyncio.CancelledError:
+        if not lease.stopping:
+            raise
+        return ActionResult(step.action, False, 'Screen capture stopped; a transmission already in flight may have reached Telegram.')
+    except Exception:
+        return ActionResult(step.action, False, 'Screen capture failed or the required indicator was unavailable; no photo was sent.')
+    finally:
+        if monitor:
+            monitor.cancel()
+        if lease.indicator is not None:
+            await lease.indicator.close()
+        if context.application.bot_data.get('screen_capture_lease') is lease:
+            context.application.bot_data.pop('screen_capture_lease', None)
+
+
+@owner_only
+async def cmd_screen(update, context):
+    if context.args:
+        await update.effective_message.reply_text('Usage: /screen')
+        return
+    await _direct(update, context, 'Take and send one full-screen photo with a visible indicator', 'screenshot', {})
+
+
+@owner_only
+async def cmd_window(update, context):
+    title = ' '.join(context.args or []).strip()
+    if len(title) > 200:
+        await update.effective_message.reply_text('Window title must be at most 200 characters.')
+        return
+    params = {'title': title} if title else {}
+    await _direct(update, context, 'Take and send one window photo with a visible indicator', 'window_screenshot', params)
+
+
+@owner_only
+async def cmd_watch(update, context):
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text('Usage: /watch start [seconds] [minutes], /watch speed N, /watch stop')
+        return
+    op = args[0].lower()
+    if op == 'stop' and len(args) == 1:
+        data = context.application.bot_data
+        data['watch_epoch'] = data.get('watch_epoch', 0) + 1
+        controller = data.get('watch_controller')
+        stopped = controller.stop_now('requested') if controller else False
+        store = data['plans']
+        cancelled = [p for p in list(store.values()) if p.requester_id == update.effective_user.id
+                     and any(st.action in {'watch_start', 'watch_speed'} for st in p.plan.steps)]
+        for pending in cancelled:
+            store.pop(pending.plan_id, None)
+        for pending in cancelled:
+            await _mark_messages(context, pending, '⏹ Screen sharing request cancelled.')
+        await update.effective_message.reply_text('⏹ Screen sharing stopped or cancelled.' if stopped or cancelled
+                                                  else 'No screen sharing is running or pending.')
+        return
+    if op == 'start' and 1 <= len(args) <= 3:
+        try:
+            seconds = int(args[1]) if len(args) > 1 else DEFAULT_INTERVAL
+            minutes = int(args[2]) if len(args) > 2 else DEFAULT_MINUTES
+            if not MIN_INTERVAL <= seconds <= MAX_INTERVAL or not 1 <= minutes <= MAX_MINUTES:
+                raise ValueError
+        except ValueError:
+            await update.effective_message.reply_text('Use /watch start [2–60 seconds] [1–60 minutes].')
+            return
+        controller = context.application.bot_data.get('watch_controller')
+        if controller is not None and controller.active is not None:
+            await update.effective_message.reply_text('A screen-sharing session is already active or starting.')
+            return
+        await _direct(update, context, 'Start visible full-screen sharing to this chat', 'watch_start',
+                      {'seconds': str(seconds), 'minutes': str(minutes)})
+        return
+    if op == 'speed' and len(args) == 2:
+        try:
+            seconds = int(args[1])
+            if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
+                raise ValueError
+        except ValueError:
+            await update.effective_message.reply_text('Use /watch speed N where N is 2–60 seconds.')
+            return
+        controller = context.application.bot_data.get('watch_controller')
+        session = controller.active if controller else None
+        if session is None or session.stopping or session.user_id != update.effective_user.id:
+            await update.effective_message.reply_text('No active screen-sharing session in this chat.')
+            return
+        await _direct(update, context, 'Change speed of the active screen-sharing session', 'watch_speed',
+                      {'seconds': str(seconds), 'session': session.id})
+        return
+    await update.effective_message.reply_text('Usage: /watch start [seconds] [minutes], /watch speed N, /watch stop')
+
+
+
 # ---------------------------------------------------------------------------
 # Errors and lifecycle
 # ---------------------------------------------------------------------------
@@ -1452,6 +1637,9 @@ async def _post_init(application: Application) -> None:
             BotCommand("chain", "propose several steps as one plan"),
             BotCommand("macro", "save, run or delete a macro"),
             BotCommand("macros", "list saved macros"),
+            BotCommand("screen", "approve a full-screen photo"),
+            BotCommand("window", "approve a window photo"),
+            BotCommand("watch", "start, adjust or stop visible screen sharing"),
         ])
     except TelegramError as exc:
         audit.warning("Could not set bot commands", error=str(exc))
@@ -1489,6 +1677,17 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
+    lease = application.bot_data.get("screen_capture_lease")
+    if lease is not None:
+        lease.stop_now()
+    controller = application.bot_data.get("watch_controller")
+    if controller is not None and controller.active is not None:
+        session = controller.active
+        controller.stop_now("assistant shutdown")
+        try:
+            await asyncio.wait_for(asyncio.shield(session.task), 5)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
     task = application.bot_data.get("scheduler_task")
     if task is not None:
         task.cancel()
@@ -1496,6 +1695,7 @@ async def _post_shutdown(application: Application) -> None:
             await task
         except (asyncio.CancelledError, Exception):
             pass
+    audit.close()  # release the log file so it can be rotated/deleted (Windows)
     clear_abort()
 
 
@@ -1531,6 +1731,9 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("chain", cmd_chain))
     application.add_handler(CommandHandler("macro", cmd_macro))
     application.add_handler(CommandHandler("macros", cmd_macros))
+    application.add_handler(CommandHandler("screen", cmd_screen))
+    application.add_handler(CommandHandler("window", cmd_window))
+    application.add_handler(CommandHandler("watch", cmd_watch))
     application.add_handler(CommandHandler(["yes", "approve"], cmd_yes))
     application.add_handler(CommandHandler(["no", "deny"], cmd_no))
     application.add_handler(CallbackQueryHandler(on_button, pattern=r"^(apv|deny):"))

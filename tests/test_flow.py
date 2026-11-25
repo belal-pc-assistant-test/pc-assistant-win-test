@@ -61,7 +61,7 @@ def make_config(tmp: Path, ids: str = str(OWNER_ID), approvers: str | None = Non
     body += (
         "\n[planner]\nmode = keywords\n"
         "\n[ollama]\nuse_ollama = false\n"
-        "\n[behaviour]\ncommand_timeout = 5\n"
+        "\n[behaviour]\ncommand_timeout = 60\n"
         "\n[paths]\n"
         f"workspace_root = {tmp.as_posix()}\n"
         f"log_file = {(tmp / 'logs' / 'a.log').as_posix()}\n"
@@ -196,6 +196,9 @@ class ConfirmationGateTests(unittest.TestCase):
         botmod.audit.setup(self.dir / "logs" / "a.log", "CRITICAL")  # quiet
 
     def tearDown(self):
+        # Release the audit log handle first: Windows cannot delete an open
+        # file (WinError 32) and made test_approve_button_executes fail here.
+        botmod.audit.close()
         self.tmpdir.cleanup()
 
     def _plan(self, content: str = "written by the bot") -> tuple[Plan, Path]:
@@ -335,6 +338,9 @@ class CodeConfirmationTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        # Release the audit log handle first: Windows cannot delete an open
+        # file (WinError 32) and made test_approve_button_executes fail here.
+        botmod.audit.close()
         self.tmpdir.cleanup()
 
     def _add(self, code: str = "K7M2QP", plan: Plan | None = None) -> PendingPlan:
@@ -469,6 +475,9 @@ class PanicAndUploadTests(unittest.TestCase):
         botmod.audit.setup(self.dir / "logs" / "a.log", "CRITICAL")
 
     def tearDown(self):
+        # Release the audit log handle first: Windows cannot delete an open
+        # file (WinError 32) and made test_approve_button_executes fail here.
+        botmod.audit.close()
         self.tmpdir.cleanup()
 
     def test_panic_cancels_every_pending_plan(self):

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
+import io
 import re
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -158,53 +158,33 @@ def open_url(params: dict[str, str], ctx: ActionContext) -> ActionResult:
 # screenshots
 # ---------------------------------------------------------------------------
 
-def _screenshot_destination(config: Config, save_path: str | None) -> Path:
-    if save_path:
-        out = resolve_path(save_path, config, "Screenshot path")
-        if out.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-            out = out.with_suffix(".png")
-        return out
-    config.screenshots_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return config.screenshots_dir / f"screenshot_{stamp}.png"
+def encode_photo(image: Any, max_width: int = 2560, quality: int = 84) -> bytes:
+    """Encode an image in memory; constrain Telegram image dimensions."""
+    image = image.convert("RGB")
+    image.thumbnail((max_width, 2560))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return buffer.getvalue()
 
 
-def _save_image(image: Any, out: Path) -> None:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if out.suffix.lower() in {".jpg", ".jpeg"}:
-        image.convert("RGB").save(out, quality=90)
-    else:
-        image.save(out)
+def capture_desktop_jpeg(max_width: int = 2560, quality: int = 84) -> bytes:
+    try:
+        from PIL import ImageGrab
+        image = ImageGrab.grab(**({"all_screens": True} if IS_WINDOWS else {}))
+        return encode_photo(image, max_width=max_width, quality=quality)
+    except Exception as exc:
+        raise ActionError("Screen capture failed. Unlock the desktop and retry.") from exc
 
 
 def take_screenshot(params: dict[str, str], ctx: ActionContext) -> ActionResult:
-    config = ctx.config
+    if not ctx.capture_allowed:
+        raise ActionError("Screen capture requires approval and a visible sharing indicator.")
+    if params.get("path"):
+        raise ActionError("Saving screenshots to disk is disabled. Request a photo instead.")
     started = time.perf_counter()
-    try:
-        from PIL import ImageGrab
-    except ImportError as exc:  # pragma: no cover
-        raise ActionError("Pillow is not installed, run: pip install Pillow") from exc
-
-    out = _screenshot_destination(config, params.get("path"))
-    grab_kwargs: dict[str, Any] = {"all_screens": True} if IS_WINDOWS else {}
-    try:
-        image = ImageGrab.grab(**grab_kwargs)
-    except Exception as exc:
-        raise ActionError(
-            f"Screen capture failed: {exc}. "
-            "(On Windows this normally works; make sure the PC is not locked.)"
-        ) from exc
-
-    _save_image(image, out)
-    return ActionResult(
-        "screenshot",
-        True,
-        f"Screenshot saved: {out} ({image.width}×{image.height}, "
-        f"{out.stat().st_size / 1024:.0f} KB)",
-        files=[out],
-        files_as_document=config.screenshot_as_document,
-        duration=time.perf_counter() - started,
-    )
+    photo = capture_desktop_jpeg()
+    return ActionResult("screenshot", True, "Full-screen photo captured in memory.",
+                        photo=photo, duration=time.perf_counter() - started)
 
 
 # ---------------------------------------------------------------------------

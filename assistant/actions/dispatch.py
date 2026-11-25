@@ -31,6 +31,8 @@ HANDLERS: dict[str, Handler] = {
     "audit_read": personal.audit_read,
     "reminder_delivery": personal.reminder_delivery,
     "cloud_plan": personal.cloud_plan,
+    "watch_start": personal.watch_action,
+    "watch_speed": personal.watch_action,
     "powershell": core.powershell,
     "open": core.open_target,
     "open_url": core.open_url,
@@ -62,6 +64,8 @@ def execute_step(
     transport: Transport | None = None,
     jobs: Any = None,
     chat_id: int | None = None,
+    capture_allowed: bool = False,
+    capture_window_handle: int = 0,
 ) -> ActionResult:
     """Run one step and never raise: failures come back as ``ok=False``."""
     started = time.perf_counter()
@@ -73,7 +77,8 @@ def execute_step(
         return ActionResult(step.action, False, f"❌ Unsupported action: {step.action}")
 
     context = ActionContext(
-        config=config, transport=transport, jobs=jobs, chat_id=chat_id
+        config=config, transport=transport, jobs=jobs, chat_id=chat_id,
+        capture_allowed=capture_allowed, capture_window_handle=capture_window_handle
     )
     try:
         result = handler(step.params, context)

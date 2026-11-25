@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from assistant.config import normalize_path
 from test_assistant import make_config
 from test_flow import FakeTransport, FakeQuery, FakeMessage, make_context, make_update, make_pending
 from assistant import bot
@@ -40,9 +41,13 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(overall_risk(['system_info', 'powershell']), 'high')
 
     def test_system_info_and_process_listing(self):
-        self.assertTrue(self.run_action('system_info').ok)
+        # Real PowerShell on Windows can take >20 s on a cold CI runner (CIM
+        # queries); make_config now allows 60 s so this is not a timeout test.
+        self.assertTrue(self.run_action('system_info').ok,
+                        getattr(self.run_action('system_info'), 'output', ''))
         for sort in ('cpu', 'memory', 'name'):
-            self.assertTrue(self.run_action('list_processes', {'sort': sort}).ok)
+            result = self.run_action('list_processes', {'sort': sort})
+            self.assertTrue(result.ok, result.output)
         self.assertFalse(self.run_action('list_processes', {'sort': 'bad'}).ok)
 
     def test_protected_processes(self):
@@ -66,6 +71,33 @@ class ActionTests(unittest.TestCase):
             self.assertTrue(self.run_action('notification', {'text':payload}).ok)
             self.assertNotIn(payload, ps.call_args.args[0])
 
+    def test_volume_requires_explicit_mode(self):
+        """An unknown or missing mode must change nothing (no mute fallback)."""
+        proc = SimpleNamespace(returncode=0, stdout='', stderr='')
+        with patch.object(system, 'IS_WINDOWS', True), \
+             patch.object(system, 'run_powershell', return_value=proc) as ps:
+            for params in ({}, {'mode': ''}, {'mode': '   '}, {'mode': 'louder'},
+                           {'mode': 'MUTE_MUSIC'}, {'mode': 'set'}):
+                result = self.run_action('volume', params)
+                self.assertFalse(result.ok, (params, result.output))
+                self.assertIn('mode', result.output.lower())
+                self.assertIn('nothing was changed', result.output.lower())
+            ps.assert_not_called()  # no key press may happen for bad modes
+        with patch.object(system, 'IS_WINDOWS', True), \
+             patch.object(system, 'run_powershell', return_value=proc) as ps:
+            for params in ({'mode': 'mute'}, {'mode': 'unmute'}, {'mode': 'toggle'},
+                           {'mode': 'up', 'steps': '3'}, {'mode': 'down'},
+                           {'mode': 'set', 'level': '40'}):
+                self.assertTrue(self.run_action('volume', params).ok, params)
+            self.assertEqual(ps.call_count, 6)
+
+    def test_volume_key_sequence_unknown_mode_raises(self):
+        with self.assertRaises(Exception):
+            system.volume_key_sequence('louder', None, 5)
+        self.assertEqual(system.volume_key_sequence('mute', None, 1), ['mute'])
+        self.assertEqual(system.volume_key_sequence('up', None, 3), ['up'] * 3)
+        self.assertEqual(system.volume_key_sequence('set', 50, 5)[-1], 'up')
+
     def test_clipboard(self):
         with patch.object(system, '_clipboard_read', return_value='secret'), patch.object(system, '_clipboard_write') as write:
             self.assertIn('secret', self.run_action('clipboard_get').output)
@@ -75,7 +107,10 @@ class ActionTests(unittest.TestCase):
     def test_send_file_allowlist_and_size(self):
         file = self.root / 'doc.txt'; file.write_bytes(b'abc')
         result = self.run_action('send_file', {'path':str(file)})
-        self.assertTrue(result.ok); self.assertEqual(result.files, [file])
+        self.assertTrue(result.ok, result.output)
+        # The action returns the normalized path (8.3 short names expanded on
+        # Windows), so compare in normalized form instead of the raw literal.
+        self.assertEqual(result.files, [normalize_path(file)])
         self.assertFalse(self.run_action('send_file', {'path':str(self.root.parent / 'outside')}).ok)
         self.config.max_send_file_mb = 0
         self.assertFalse(self.run_action('send_file', {'path':str(file)}).ok)
@@ -99,13 +134,13 @@ class ActionTests(unittest.TestCase):
             self.assertTrue(self.run_action('open_url', {'url':'https://example.com'}).ok)
             op.assert_called_once()
 
-    def test_window_screenshot_falls_back(self):
-        from assistant.actions.base import ActionResult
+    def test_window_screenshot_fails_without_full_screen_fallback(self):
         proc = SimpleNamespace(returncode=1, stdout='', stderr='no window')
-        fallback = ActionResult('screenshot', True, 'full screen')
-        with patch.object(system, 'IS_WINDOWS', True), patch.object(system, 'run_powershell', return_value=proc), patch.object(system, 'take_screenshot', return_value=fallback):
-            result = self.run_action('window_screenshot', {'title':'missing'})
-            self.assertTrue(result.ok); self.assertIn('full screen', result.output)
+        with patch.object(system, 'IS_WINDOWS', True), patch.object(system, 'run_powershell', return_value=proc), patch('assistant.actions.core.capture_desktop_jpeg') as capture:
+            result = self.run_action('window_screenshot', {'title':'missing'}, capture_allowed=True)
+            self.assertFalse(result.ok)
+            self.assertIn('no full-screen fallback', result.output)
+            capture.assert_not_called()
 
     def test_jobs_persist(self):
         store = JobStore(self.root / 'jobs.json')

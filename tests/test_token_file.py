@@ -132,8 +132,11 @@ class TokenFileTests(unittest.TestCase):
 
     def test_installer_does_not_prompt_when_file_exists(self):
         script = (Path(__file__).resolve().parent.parent / 'install.bat').read_text()
-        self.assertLess(script.index('if exist "token.txt"'), script.index('choice /c YN'))
-        self.assertIn('goto after_token', script[script.index('if exist "token.txt"'):script.index('choice /c YN')])
+        # The interactive prompt is a set /p read (EOF-safe; choice could hang
+        # with stdin closed), and token.txt must short-circuit before it.
+        prompt_marker = 'set /p "SAVE_TOKEN='
+        self.assertLess(script.index('if exist "token.txt"'), script.index(prompt_marker))
+        self.assertIn('goto after_token', script[script.index('if exist "token.txt"'):script.index(prompt_marker)])
         self.assertIn('main.py --no-token-prompt', script)
 
     def test_zip_builder_excludes_token_txt(self):

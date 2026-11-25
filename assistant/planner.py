@@ -217,7 +217,7 @@ ALLOWED ACTIONS — exact names, exact params, nothing else:
   "window_screenshot"{"title": "<optional window title fragment>"}
   "lock_screen"      {}
   "notification"     {"title": "<optional>", "text": "<message>"}
-  "volume"           {"mode": "mute|toggle|up|down|set", "level": "0-100", "steps": "5"}
+  "volume"           {"mode": "mute|unmute|toggle|up|down|set", "level": "0-100", "steps": "5"}
   "clipboard_get"    {}
   "clipboard_set"    {"text": "<text to copy>"}
   "read_file"        {"path": "<absolute path of an existing text file>"}
@@ -1204,7 +1204,7 @@ def rule_based_plan(request: str, workspace_root: Path | None = None) -> Plan:
     if any(kw in low for kw in SCREENSHOT_KW):
         return keyword_plan(
             "Take a screenshot of the screen and send it back.",
-            [Step("screenshot", {}, "Capture the screen and return a PNG")],
+            [Step("screenshot", {}, "Capture the screen and return an approved JPEG photo")],
         )
 
     # 3) List folder

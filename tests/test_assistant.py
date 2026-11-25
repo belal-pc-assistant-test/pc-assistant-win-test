@@ -43,7 +43,10 @@ def make_config(tmp: Path, *, token: str = "123456789:AAHtest_token_value_123456
         "base_url = http://127.0.0.1:11434\n"
         "model = qwen2.5:3b\n"
         "\n[behaviour]\n"
-        "command_timeout = 5\n"
+        # 60 s: real PowerShell/CIM calls (system_info, processes) are slow on
+        # cold Windows CI runners; 5 s made test_system_info_and_process_listing
+        # report a timeout there.
+        "command_timeout = 60\n"
         "max_output_chars = 500\n"
         "blocked_patterns = forbidden-flag\n"
         "\n[paths]\n"
@@ -64,7 +67,7 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(cfg.is_allowed(99))
             self.assertFalse(cfg.is_allowed(None))
             self.assertFalse(cfg.use_ollama)
-            self.assertEqual(cfg.command_timeout, 5)
+            self.assertEqual(cfg.command_timeout, 60)
             self.assertEqual(cfg.blocked_patterns, ["forbidden-flag"])
             self.assertEqual(cfg.planner_mode, "keywords")
 

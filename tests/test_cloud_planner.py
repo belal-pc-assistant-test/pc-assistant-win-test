@@ -220,7 +220,13 @@ class CloudPlannerTests(unittest.TestCase):
     def test_unreachable_endpoint(self):
         with self.assertRaises(PlannerError) as ctx:
             self.planner(url="http://127.0.0.1:9/openai", timeout=2).plan("x", self.tmp, 6)
-        self.assertIn("unreachable", str(ctx.exception))
+        message = str(ctx.exception)
+        # Linux reports a refused connect as "unreachable"; a slow Windows
+        # connect surfaces as "timed out". Either way the planner must fail
+        # safely (PlannerError -> the facade falls back to the next backend).
+        self.assertTrue(
+            "unreachable" in message or "timed out" in message, message
+        )
 
     def test_non_json_reply(self):
         MockPollinations.behavior = "notjson"
