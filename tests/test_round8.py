@@ -22,7 +22,7 @@ from test_flow import (  # noqa: E402  (shared fakes; also sets a private token 
     make_config, make_context, make_update,
 )
 
-from _hermetic import IsolatedCase, ModuleGuard  # noqa: E402
+from _hermetic import IsolatedCase, ModuleGuard, release_log_then_remove  # noqa: E402
 
 from telegram.ext import ApplicationHandlerStop  # noqa: E402
 
@@ -66,6 +66,9 @@ class _Tmp(IsolatedCase):
     def setUp(self) -> None:
         super().setUp()
         self.tmpdir = tempfile.TemporaryDirectory()
+        # Registered here, not in tearDown: cleanups still run when a subclass setUp fails,
+        # so the log is always closed before its folder is removed (Windows).
+        self.addCleanup(release_log_then_remove, self.tmpdir)
         self.dir = Path(self.tmpdir.name)
         self.config = make_config(self.dir)
         # The workspace is a subfolder, so "outside" really is outside the roots.
@@ -78,10 +81,6 @@ class _Tmp(IsolatedCase):
         self.secret = self.outside / "secret.txt"
         self.secret.write_text(SECRET_TEXT, encoding="utf-8")
         botmod.audit.setup(self.dir / "logs" / "a.log", "CRITICAL")
-
-    def tearDown(self) -> None:
-        botmod.audit.close()
-        self.tmpdir.cleanup()
 
 
 # ---------------------------------------------------------------------------

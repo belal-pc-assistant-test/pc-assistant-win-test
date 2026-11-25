@@ -131,3 +131,18 @@ class IsolatedCase(unittest.TestCase):
         self.addCleanup(setattr, token_store, "_last_powershell_error", saved_error)
         base.clear_abort()
         self.addCleanup(base.clear_abort)
+
+
+def release_log_then_remove(temp_dir: tempfile.TemporaryDirectory) -> None:
+    """Close the audit log, then delete its temporary folder.
+
+    Windows refuses to delete a folder while its log file is still open (WinError 32),
+    so the order matters. Register this one function with ``addCleanup``; do not register
+    the log close and the folder removal separately, because cleanups run last-in,
+    first-out.
+    """
+    try:
+        audit.close()
+    finally:
+        temp_dir.cleanup()
+

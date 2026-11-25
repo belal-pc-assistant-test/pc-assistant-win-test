@@ -16,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from _hermetic import VIOLATIONS, ForbiddenCall, IsolatedCase, ModuleGuard  # noqa: E402
+from _hermetic import VIOLATIONS, ForbiddenCall, IsolatedCase, ModuleGuard, release_log_then_remove  # noqa: E402
 from assistant import audit, token_store, winshell  # noqa: E402
 from assistant.actions import base, system  # noqa: E402
 from assistant.actions.base import ActionError  # noqa: E402
@@ -95,9 +95,8 @@ class DecodeAndSanitizeTests(IsolatedCase):
     def setUp(self):
         super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(release_log_then_remove, self.tmp)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
-        self.addCleanup(audit.close)
 
     def test_decode_accepts_text_bytes_and_nothing(self):
         self.assertEqual(winshell.decode_output("text"), "text")
@@ -176,9 +175,8 @@ class TokenStoreLaunchTests(IsolatedCase):
     def setUp(self):
         super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(release_log_then_remove, self.tmp)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
-        self.addCleanup(audit.close)
 
     def _capture(self, result):
         seen = {}
@@ -280,9 +278,8 @@ class ActionLaunchTests(IsolatedCase):
     def setUp(self):
         super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(release_log_then_remove, self.tmp)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
-        self.addCleanup(audit.close)
         self.exe = str(Path(self.tmp.name) / "powershell.exe")
 
     def test_run_powershell_starts_the_full_path_without_the_module_path(self):
@@ -335,9 +332,8 @@ class CoreActionOutputTests(IsolatedCase):
     def setUp(self):
         super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(release_log_then_remove, self.tmp)
         audit.setup(Path(self.tmp.name) / "a.log", "CRITICAL")
-        self.addCleanup(audit.close)
 
     def _ctx(self):
         from assistant.actions.base import ActionContext

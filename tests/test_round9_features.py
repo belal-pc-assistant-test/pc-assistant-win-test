@@ -18,9 +18,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from _hermetic import IsolatedCase, ModuleGuard  # noqa: E402
+from _hermetic import IsolatedCase, ModuleGuard, release_log_then_remove  # noqa: E402
 from _bootstrap import PROJECT_DIR  # noqa: E402
-from assistant import app_allowlist, health, pause, planner  # noqa: E402
+from assistant import app_allowlist, audit, health, pause, planner  # noqa: E402
 from assistant.action_spec import BOT_ONLY_ACTIONS, RISK_HIGH, VALID_ACTIONS, risk_of  # noqa: E402
 from assistant.actions import apps, dispatch  # noqa: E402
 from assistant.actions.base import ActionContext, ActionError  # noqa: E402
@@ -532,19 +532,47 @@ class HealthWiringTests(IsolatedCase):
 
 
 class AppCommandFlowTests(IsolatedCase):
-    """The real /install, /uninstall and /health handlers, with fake Telegram objects."""
+    """The real /install, /uninstall and /health handlers, with fake Telegram objects.
+
+    /health runs as if on Windows, but every probe is stubbed: no PowerShell, no drive
+    query, no disk query. No real process starts on any platform.
+    """
 
     def setUp(self):
         super().setUp()
         from test_flow import make_config, make_context
-        from assistant import audit
         self._tmp = tempfile.TemporaryDirectory()
+        # One cleanup closes the log and then removes the folder (Windows keeps it locked).
+        self.addCleanup(release_log_then_remove, self._tmp)
         self.dir = Path(self._tmp.name)
         self.config = make_config(self.dir)
         audit.setup(self.dir / "logs" / "a.log", "CRITICAL")
         self.context = make_context(self.config)
-        self.addCleanup(audit.close)
-        self.addCleanup(self._tmp.cleanup)
+        self.probe_calls: list[str] = []
+        self._stub_health_probes()
+
+    def _patch(self, patcher):
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _stub_health_probes(self):
+        real_run_health = health.run_health
+
+        def windows_health(**kwargs):
+            return real_run_health(**{"windows": True, **kwargs})
+
+        def stub_probe(script, what):
+            self.probe_calls.append(what)
+            return _healthy_ps(script, what)
+
+        def no_powershell(script, timeout, cwd=None):
+            raise AssertionError("/health must use the stubbed probe, never PowerShell")
+
+        self._patch(mock.patch.object(health, "run_health", windows_health))
+        self._patch(mock.patch.object(health, "_ps_json", stub_probe))
+        self._patch(mock.patch.object(health, "run_powershell", no_powershell))
+        self._patch(mock.patch.object(health, "_fixed_drive_letters", lambda: ["C"]))
+        self._patch(mock.patch("shutil.disk_usage", lambda path: _usage(100, 200)))
 
     def _send(self, handler, text, args, user_id=None, winget="C:\\Tools\\winget.exe"):
         from test_flow import FakeMessage, OWNER_ID, make_update
@@ -625,6 +653,7 @@ class AppCommandFlowTests(IsolatedCase):
         message = self._send("cmd_health", "/health", [])
         self.assertTrue(any("PC health check" in text for text in message.replies))
         self.assertEqual(self._plans(), [])
+        self.assertTrue(self.probe_calls, "the stubbed health probes were not used")
 
     def test_health_refuses_other_users(self):
         from test_flow import OTHER_ID
@@ -639,6 +668,40 @@ class AppCommandFlowTests(IsolatedCase):
         with self.assertRaises(ApplicationHandlerStop):
             asyncio.run(botmod.pause_gate(make_update(message=FakeMessage("/health"), user_id=OWNER_ID),
                                           self.context))
+
+
+class LogHandleReleaseTests(IsolatedCase):
+    """The log file must be closed before its folder is deleted (Windows WinError 32)."""
+
+    def setUp(self):
+        super().setUp()
+        audit.close()  # start clean, even if another test configured the logger
+        self.addCleanup(audit.close)
+
+    def test_release_helper_closes_the_file_then_removes_the_folder(self):
+        from logging.handlers import RotatingFileHandler
+        tmp = tempfile.TemporaryDirectory()
+        log = Path(tmp.name, "logs", "a.log")
+        audit.setup(log, "CRITICAL")
+        audit.event("probe")
+        handlers = [h for h in audit._LOGGER.handlers if isinstance(h, RotatingFileHandler)]
+        self.assertEqual(len(handlers), 1)
+        self.assertTrue(log.exists())
+        release_log_then_remove(tmp)
+        self.assertIsNone(handlers[0].stream, "the log file is still open")
+        self.assertEqual(audit._LOGGER.handlers, [])
+        self.assertFalse(Path(tmp.name).exists())
+
+    def test_bot_shutdown_releases_the_log_file(self):
+        from logging.handlers import RotatingFileHandler
+        from assistant import bot as botmod
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(release_log_then_remove, tmp)
+        audit.setup(Path(tmp.name, "logs", "a.log"), "CRITICAL")
+        handler = next(h for h in audit._LOGGER.handlers if isinstance(h, RotatingFileHandler))
+        asyncio.run(botmod._post_shutdown(SimpleNamespace(bot_data={})))
+        self.assertIsNone(handler.stream, "bot shutdown left the log file open")
+        self.assertEqual(audit._LOGGER.handlers, [])
 
 
 class ReadmeRound9Tests(IsolatedCase):
