@@ -9,7 +9,7 @@ from .. import audit
 from ..action_spec import ACTION_ICONS, ACTION_TITLES, RISK_ICONS, risk_of
 from ..config import Config
 from ..planner import Step
-from . import automation, core, system, transfer, personal
+from . import apps, automation, core, system, transfer, personal
 from .base import (
     ActionContext,
     ActionError,
@@ -55,6 +55,9 @@ HANDLERS: dict[str, Handler] = {
     "find_files": transfer.find_files,
     "send_file": transfer.send_file,
     "receive_file": transfer.receive_file,
+    # bot-only: reachable only from an approved bot plan (see action_spec.BOT_ONLY_ACTIONS)
+    "app_install": apps.app_install,
+    "app_uninstall": apps.app_uninstall,
 }
 
 

@@ -16,6 +16,8 @@ def build_zip(root: Path, output: Path) -> None:
     root = root.resolve()
     sources = [root / name for name in TOP_LEVEL]
     sources += sorted((root / "assistant").rglob("*.py"))
+    # Shipped data files (the /install allow-list). Never user data or config.
+    sources += sorted((root / "assistant" / "data").glob("*.json"))
     sources += sorted((root / "tests").glob("test_*.py"))
     sources += sorted((root / "tests").glob("_*.py"))  # shared test helpers (no secrets)
     # CI workflow for the Windows-only tests (no secrets; it runs on a GitHub Windows runner).
@@ -50,8 +52,11 @@ def build_zip(root: Path, output: Path) -> None:
             relative = source.relative_to(root)
             if any(part.casefold() in EXCLUDED_NAMES for part in relative.parts):
                 continue
-            if any(part in {"__pycache__", ".venv", "data", "models", "logs", "downloads", "screenshots", "tools"}
+            if any(part in {"__pycache__", ".venv", "models", "logs", "downloads", "screenshots", "tools"}
                    for part in relative.parts):
+                continue
+            # The top-level data/ folder holds runtime state. assistant/data/ ships on purpose.
+            if relative.parts and relative.parts[0] == "data":
                 continue
             # Do not follow links into private data outside the release tree.
             if source.is_symlink() or not source.resolve().is_relative_to(root):

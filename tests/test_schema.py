@@ -183,7 +183,8 @@ class BuiltinValidationTests(unittest.TestCase):
             _validate_builtin(plan, 6)
 
     def test_every_action_has_a_param_spec(self):
-        self.assertEqual(set(PARAM_SPEC), set(VALID_ACTIONS))
+        # Round 9: the bot-only winget actions have a spec too, but the planner never sees them.
+        self.assertEqual(set(PARAM_SPEC), set(VALID_ACTIONS) | {'app_install', 'app_uninstall'})
 
 
 class PathHygieneTests(unittest.TestCase):

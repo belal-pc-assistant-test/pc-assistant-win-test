@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import token_store, audit
+from . import app_allowlist
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
@@ -218,6 +219,8 @@ class Config:
     remote_tunnel_order: list[str] = field(default_factory=lambda: ["cloudflare", "localhost.run"])
     cloudflared_sha256: str = ""
     tools_dir: Path = field(default_factory=lambda: PROJECT_DIR / "tools")
+    # Owner-added /install and /uninstall entries: name -> winget id (see app_allowlist).
+    extra_allowed_apps: dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     @property
@@ -368,6 +371,13 @@ def load_config(path: str | Path | None = None) -> Config:
         _get_str(paths, "screenshots_dir", "screenshots"), PROJECT_DIR
     )
 
+    apps_section = parser["apps"] if "apps" in parser else parser["DEFAULT"]
+    try:
+        extra_apps = app_allowlist.parse_extra(
+            apps_section.get("extra_allowed_apps"), reserved=app_allowlist.load_builtin().keys())
+    except ValueError as exc:
+        raise ConfigError(f"[apps] extra_allowed_apps: {exc}") from exc
+
     remote = parser["remote"] if "remote" in parser else parser["DEFAULT"]
     remote_default = _get_int(remote, "default_minutes", 15)
     remote_max = _get_int(remote, "max_minutes", 60)
@@ -425,4 +435,5 @@ def load_config(path: str | Path | None = None) -> Config:
         remote_tunnel_order=tunnel_order,
         cloudflared_sha256=pinned,
         tools_dir=_resolve_dir(_get_str(remote, "tools_dir", "tools"), PROJECT_DIR),
+        extra_allowed_apps=extra_apps,
     )

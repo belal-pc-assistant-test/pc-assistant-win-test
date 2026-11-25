@@ -105,13 +105,20 @@ PARAM_SPEC: dict[str, dict[str, list[str]]] = {
     "powershell": {"required": ["command"], "optional": []},
     "kill_process": {"required": [], "optional": ["name", "pid", "force"]},
     "power": {"required": ["mode"], "optional": ["delay"]},
+    # bot-only (BOT_ONLY_ACTIONS): name is the allow-list key, id the exact winget id
+    "app_install": {"required": ["name", "id"], "optional": []},
+    "app_uninstall": {"required": ["name", "id"], "optional": []},
 }
 
 #: Actions that only the bot can create (approval buttons, /remote). The planners
 #: cannot emit them because they are not in VALID_ACTIONS, and the generic executor
 #: refuses them, so a remote session can only start from the approved /remote flow.
+#: winget installs and removals (Round 9). Only an approved bot plan can carry them; the
+#: planner never sees them. Params are {"name", "id"}; the executor re-checks the allow-list.
 BOT_ONLY_ACTIONS: dict[str, str] = {
     "remote_start": RISK_HIGH,
+    "app_install": RISK_HIGH,
+    "app_uninstall": RISK_HIGH,
 }
 
 #: Highest risk an action can have. Shown next to every step.
@@ -180,6 +187,8 @@ ACTION_TITLES: dict[str, str] = {
     "kill_process": "Kill process",
     "power": "Power off / restart / sleep",
     "remote_start": "Start remote desktop (view + control)",
+    "app_install": "Install an allow-listed app with winget",
+    "app_uninstall": "Uninstall an allow-listed app with winget",
 }
 
 ACTION_ICONS: dict[str, str] = {
@@ -208,6 +217,8 @@ ACTION_ICONS: dict[str, str] = {
     "kill_process": "☠️",
     "power": "⏻",
     "remote_start": "🖥️",
+    "app_install": "📦",
+    "app_uninstall": "🗑️",
 }
 
 #: Longest accepted value per param (characters). Default 1000.

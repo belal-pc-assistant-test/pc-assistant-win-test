@@ -45,6 +45,7 @@ from telegram.ext import (
 )
 
 from . import audit
+from . import app_allowlist, health
 from .action_spec import (
     ACTION_ICONS,
     ACTION_TITLES,
@@ -54,6 +55,7 @@ from .action_spec import (
     risk_of,
 )
 from .actions import execute_step, request_abort, clear_abort, abort_requested
+from .actions.apps import winget_path
 from .actions.base import REGISTRY, sanitize_filename, unique_destination, ActionResult
 from .config import Config
 from .jobs import JobStore
@@ -121,6 +123,9 @@ MSG = {
         "/watch stop – stop immediately; default 3s/10min, min 2s, max 60min\n"
         "/remote start [minutes] – private remote desktop: full view AND mouse/keyboard control; one approval; default 15, max 60 min\n"
         "/remote status – session state (never the link) · /remote stop – end now and close the tunnel\n"
+        "/health – read-only PC check: disk, memory, uptime, restart pending, Defender, firewall, Windows Update (no approval)\n"
+        "/install NAME – install an allow-listed app with winget (approval needed, HIGH RISK, UAC prompt on the PC)\n"
+        "/uninstall NAME – remove an allow-listed app with winget (approval needed, HIGH RISK)\n"
         "A visible indicator is required; photos are sent only to allowed private chats.\n"
         "/note TEXT – save a note; /notes – view notes; /forget N|language|all – forget memory\n"
         "/language en|ar – save a language preference\n"
@@ -142,7 +147,7 @@ MSG = {
         "system report · list/kill processes · open app/file/URL · full &amp; window "
         "screenshots · lock · notification · volume · clipboard read/write · read, "
         "write, list, search files · send file to you · save a file you upload · "
-        "reminders · scheduled commands · PowerShell · power off/restart/sleep.\n"
+        "reminders · scheduled commands · PowerShell · power off/restart/sleep · winget install/remove of allow-listed apps.\n"
         "Each step is labelled 🟢 low, 🟡 medium or 🔴 high risk."
     ),
     "denied": "🚫 Not authorised. This bot only serves its configured owner.\nغير مصرح لك باستخدام هذا البوت.",
@@ -244,6 +249,8 @@ _FRIENDLY = {
     "screenshot": ("Capture the full screen and send the photo with a visible indicator.", "سيتم التقاط الشاشة وإرسال الصورة إلى تيليجرام مع إظهار مؤشر واضح."),
     "window_screenshot": ("Capture the requested window only; no full-screen fallback. A visible indicator is required.", "سيتم تصوير النافذة فقط مع إظهار مؤشر واضح، دون التقاط الشاشة كاملة عند الفشل."),
     "watch_start": ("Start visible, temporary full-screen sharing to this private chat until stopped or timed out.", "ستبدأ مشاركة الشاشة كاملة بشكل واضح ومؤقت إلى هذه المحادثة حتى الإيقاف أو انتهاء المدة."),
+    "app_install": ("Install the named app with winget: exact winget ID, winget source only, latest version. Windows will show a UAC prompt on this PC's screen; you must accept it there. The bot never answers or bypasses UAC.", "سيتم تثبيت التطبيق المحدد عبر winget: معرّف الحزمة الدقيق ومصدر winget فقط وأحدث إصدار. سيظهر مربع UAC على شاشة هذا الجهاز ويجب قبوله هناك. لا يتجاوز البوت UAC."),
+    "app_uninstall": ("Remove the named app with winget (exact winget ID, winget source only). Windows will show a UAC prompt on this PC's screen; you must accept it there.", "سيتم إزالة التطبيق المحدد عبر winget (معرّف دقيق ومصدر winget فقط). سيظهر مربع UAC على شاشة هذا الجهاز ويجب قبوله هناك."),
     "remote_start": ("Give full view and mouse/keyboard control of this PC through a private link until the time ends or you stop it.", "سيتم منحك رؤية كاملة وتحكماً بالفأرة ولوحة المفاتيح في هذا الجهاز عبر رابط خاص حتى انتهاء المدة أو إيقافها."),
     "watch_speed": ("Change the interval of the existing visible sharing session.", "سيتم تغيير مدة التحديث لجلسة المشاركة الحالية المرئية."),
     "open": ("Open the specified target on the PC.", "سيتم فتح العنصر المحدد على الجهاز."),
@@ -1571,8 +1578,8 @@ async def cmd_macro(update, context):
             await update.effective_message.reply_text('First request a multi-step plan, then send /macro save NAME before approving it.')
             return
         plan = existing[-1].plan
-        if any(step.action in {'memory_update', 'briefing_schedule', 'job_cancel', 'remote_start'} for step in plan.steps):
-            await update.effective_message.reply_text('Personal-memory, scheduler and remote-session steps cannot be saved as macros.')
+        if any(step.action in {'memory_update', 'briefing_schedule', 'job_cancel', 'remote_start', 'app_install', 'app_uninstall'} for step in plan.steps):
+            await update.effective_message.reply_text('Personal-memory, scheduler, remote-session and app install/remove steps cannot be saved as macros.')
             return
         steps = json.dumps([{'action': st.action, 'params': st.params} for st in plan.steps], ensure_ascii=False, sort_keys=True)
         await _direct(update, context, 'Save the following steps as a macro', 'memory_update', {'op': 'save_macro', 'name': name, 'steps': steps})
@@ -1735,6 +1742,77 @@ async def _run_visible_screenshot(step, pending, context, config, transport, job
             await lease.indicator.close()
         if context.application.bot_data.get('screen_capture_lease') is lease:
             context.application.bot_data.pop('screen_capture_lease', None)
+
+
+def _user_language(config: Config, user_id: int) -> str:
+    try:
+        lang = _memory(config).get(user_id).get("language", "en")
+    except ValueError:
+        return "en"
+    return lang if lang in {"en", "ar"} else "en"
+
+
+@owner_only
+async def cmd_health(update, context):
+    """Read-only PC check (Round 9). No approval: it changes nothing."""
+    if context.args:
+        await update.effective_message.reply_text("Usage: /health")
+        return
+    config: Config = context.application.bot_data["config"]
+    language = _user_language(config, update.effective_user.id)
+    await update.effective_message.reply_text("🩺 Checking this PC (read-only)…")
+    checks = await asyncio.to_thread(health.run_health)
+    await update.effective_message.reply_text(
+        health.render(checks, language), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
+
+
+async def _app_request(update, context, action: str) -> None:
+    """Shared path for /install and /uninstall: allow-list check, then a HIGH RISK approval."""
+    config: Config = context.application.bot_data["config"]
+    verb = "install" if action == "app_install" else "uninstall"
+    apps = app_allowlist.allowed_apps(config.extra_allowed_apps)
+    args = context.args or []
+    if len(args) != 1:
+        await update.effective_message.reply_text(
+            f"Usage: /{verb} NAME. Allowed names: {app_allowlist.names_text(apps)}"
+        )
+        return
+    name = args[0].lower()
+    entry = apps.get(name)
+    if entry is None:
+        await update.effective_message.reply_text(
+            f"'{_esc(args[0][:40])}' is not on the app allow-list, so nothing was run. "
+            f"Allowed names: {_esc(app_allowlist.names_text(apps))}. To add an app, add "
+            "name=winget.id to extra_allowed_apps under [apps] in config.ini (use an ID you trust), "
+            "then restart the bot.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if winget_path() is None:
+        await update.effective_message.reply_text(
+            "winget is not available on this PC, so nothing was run. Install or update "
+            "\"App Installer\" from the Microsoft Store, then try again."
+        )
+        return
+    title, app_id = entry["title"], entry["id"]
+    if action == "app_install":
+        summary = (f"Install {title} with winget: exact id {app_id}, source winget only, latest version. "
+                   "HIGH RISK. A UAC prompt will appear on this PC's screen and must be accepted there.")
+    else:
+        summary = (f"Remove {title} with winget: exact id {app_id}, source winget only. "
+                   "HIGH RISK. A UAC prompt will appear on this PC's screen and must be accepted there.")
+    await _direct(update, context, summary, action, {"name": name, "id": app_id})
+
+
+@owner_only
+async def cmd_install(update, context):
+    await _app_request(update, context, "app_install")
+
+
+@owner_only
+async def cmd_uninstall(update, context):
+    await _app_request(update, context, "app_uninstall")
 
 
 @owner_only
@@ -1957,6 +2035,9 @@ async def _post_init(application: Application) -> None:
             BotCommand("window", "approve a window photo"),
             BotCommand("watch", "start, adjust or stop visible screen sharing"),
             BotCommand("remote", "private remote desktop (needs approval)"),
+            BotCommand("health", "read-only PC health check"),
+            BotCommand("install", "install an allow-listed app (needs approval)"),
+            BotCommand("uninstall", "remove an allow-listed app (needs approval)"),
         ])
     except TelegramError as exc:
         audit.warning("Could not set bot commands", error=str(exc))
@@ -2075,6 +2156,9 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("window", cmd_window))
     application.add_handler(CommandHandler("watch", cmd_watch))
     application.add_handler(CommandHandler("remote", cmd_remote))
+    application.add_handler(CommandHandler("health", cmd_health))
+    application.add_handler(CommandHandler("install", cmd_install))
+    application.add_handler(CommandHandler("uninstall", cmd_uninstall))
     application.add_handler(CommandHandler(["yes", "approve"], cmd_yes))
     application.add_handler(CommandHandler(["no", "deny"], cmd_no))
     application.add_handler(CallbackQueryHandler(on_button, pattern=r"^(apv|deny):"))

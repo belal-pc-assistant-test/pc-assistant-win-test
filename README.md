@@ -14,6 +14,11 @@ Control your Windows PC from Telegram. You send a request, the assistant shows a
 
 إذا لم يرد البوت، راجع قسم [Troubleshooting](#troubleshooting). الإعداد الافتراضي يسمح بالرقم `7823157087` فقط.
 
+**أوامر جديدة:**
+* `/health` يفحص حالة الجهاز (المساحة الحرة، الذاكرة، مدة التشغيل، طلب إعادة التشغيل، Windows Defender، جدار الحماية، خدمة التحديث). لا يغيّر شيئًا ولا يحتاج موافقة.
+* `/install اسم` و`/uninstall اسم` يثبتان تطبيقًا أو يزيلانه عبر winget، ولا يعملان إلا للتطبيقات الموجودة في القائمة المسموحة. كل أمر يحتاج موافقتك أولًا، ويُعلَّم بأنه عالي الخطورة. سيظهر مربع **UAC** على شاشة الجهاز ويجب قبوله هناك، والبوت لا يتجاوزه.
+* راجع قسم [Health check and app install](#health-check-and-app-install) للتفاصيل.
+
 ---
 
 ## Quick start
@@ -63,6 +68,8 @@ Control your Windows PC from Telegram. You send a request, the assistant shows a
 | `/screen`, `/window [title]` | One screenshot of the screen or of one window (needs approval) |
 | `/watch start [seconds] [minutes]`, `/watch speed N`, `/watch stop` | Visible screen sharing. Defaults: every 3 s, for 10 minutes |
 | `/remote start [minutes]`, `/remote status`, `/remote stop` | Remote desktop session. See [Remote desktop](#remote-desktop) |
+| `/health` | Read-only PC check: disk, memory, uptime, restart pending, Defender, firewall, Windows Update service. No approval. See [Health check and app install](#health-check-and-app-install) |
+| `/install NAME`, `/uninstall NAME` | Install or remove an allow-listed app with winget. Needs approval (HIGH RISK) and a UAC prompt on the PC |
 | `/note TEXT`, `/notes`, `/forget N` | Save, list or delete notes |
 | `/language ar` or `/language en` | Fallback language |
 | `/briefing now`, `/briefing daily HH:MM` | Status summary now, or every day at that time |
@@ -102,6 +109,31 @@ The session ends on **Stop**, the hotkey, `/remote stop`, `/panic`, the time lim
 * **Weak PCs lower the frame rate** (target 5 to 10 fps; quality adapts).
 * **Not yet verified live:** the banner hotkey (`RegisterHotKey`), the `localhost.run` fallback, and the whole flow with real Telegram and a real tunnel. The Stop button and `/remote stop` do not depend on the hotkey.
 
+## Health check and app install
+
+### `/health` (read-only, no approval)
+
+`/health` reads, and changes nothing. It checks each item separately:
+
+* **Disk**: free space on each fixed drive (drive letters only).
+* **Memory**, **Uptime** (warning after 14 days), **Last boot**.
+* **Restart pending**: Windows Update or servicing has asked for a restart.
+* **Windows Defender**: real-time protection on or off, and signature age (warning after 3 days). Uses `Get-MpComputerStatus`.
+* **Firewall**: on or off for each profile (`Get-NetFirewallProfile`).
+* **Windows Update service**: warning if its start type is Disabled.
+
+Each line starts with ✅ OK or ⚠️ WARNING. Each warning adds one line of advice. If an item cannot be read, it shows ❔ UNKNOWN with a short reason, and the other items still run. The output has no user names, paths or serial numbers. The verdict word is in Arabic only when your saved language is Arabic (`/language ar`). The advice is always in English. `/health` is blocked while the bot is paused, like every other command except `/resume`, `/panic` and `/status`.
+
+### `/install` and `/uninstall` (winget, approval needed)
+
+* **Allow-list.** Only apps in `assistant/data/app_allowlist.json` can be installed or removed. The shipped list is: `7zip`, `vlc`, `notepadpp`, `git`, `python`, `chrome`, `firefox`, `vscode`, `zoom`, `whatsapp`, `telegram`. Any other name is refused, and the refusal names the allow-list and how to extend it.
+* **Adding an app is deliberate.** Add it yourself in `config.ini`, under `[apps]`, as `extra_allowed_apps = name=winget.id` (comma-separated). Use an exact winget package ID you trust (`winget show --id ID --exact` shows the publisher and installer). The bot refuses a malformed value at start-up, and a name that is already built in.
+* **Approval.** The plan states the exact winget ID, the source (`winget` only) and the version (latest). It is marked HIGH RISK. Approve it with the buttons or `approve CODE` as for any plan. The executor checks the name and ID again just before it runs, so the approved ID is the one that runs.
+* **Fixed arguments.** Install: `winget install --exact --id <id> --source winget --accept-package-agreements --accept-source-agreements`. Uninstall: `winget uninstall --exact --id <id> --source winget --accept-source-agreements`. Uninstall omits `--accept-package-agreements` because `winget uninstall` does not document that option. Nothing else is added: no `--force`, `--ignore-security-hash`, `--override`, custom installer switches, local manifests, URLs or installer files. winget's own signature and hash checks stay on.
+* **UAC.** For machine-wide installs Windows shows a UAC prompt on the PC screen. You must accept it there. The bot does not answer, bypass or hide it.
+* **Pause and missing winget.** Nothing is installed while paused, and the bot checks the pause again just before running winget. If winget is not installed, the bot says so and stops.
+* **Result.** The bot reports success only when winget exits with code 0. Any other result shows the exit code and a short, sanitized reason. Paths and tokens are removed from winget's output.
+
 ## Screen sharing
 
 `/screen` and `/window` each produce a plan that you approve before any capture. `/window` uses the title you give; a window that blocks capture may come out black, and no full-screen fallback is attempted. A red indicator shows while a capture runs. `/watch` sends frames to the chat as photos at the interval you set; `/watch stop` or `/panic` ends it. Frames stay in memory; no screenshot file is written.
@@ -132,6 +164,7 @@ The second line downloads the model (not tested in this build). The model folder
 | `[behaviour] max_plan_steps`, `command_timeout`, `max_send_file_mb` | Limits on plans, commands, transfers (defaults 6 steps, 60 s, 45 MB) |
 | `[voice] model_path` | Local Whisper model folder |
 | `[remote] default_minutes`, `max_minutes`, `tunnel_order`, `tools_dir`, `cloudflared_sha256` | Remote defaults (15 and 60), tunnel order, download folder, optional SHA-256 pin |
+| `[apps] extra_allowed_apps` | Extra apps for `/install` and `/uninstall`, as `name=winget.id` pairs. Empty by default. Add only IDs you trust |
 
 ## Privacy
 
@@ -147,7 +180,9 @@ The second line downloads the model (not tested in this build). The model folder
 * Nothing acts without an approved plan. Voice, macros, reminders, scheduled jobs, forwarded text and replayed buttons cannot run a plan on their own. A plan runs at most once.
 * Approval codes are tied to the exact steps, single-use, expire after 15 minutes, and are replaced by a newer plan.
 * At most 50 plans can wait for approval. Each user may send 30 updates per 10 seconds. Requests over 2000 characters are refused.
-* Planner output must match the schema and an action allowlist. `remote_start` can only be started with `/remote start`.
+* Planner output must match the schema and an action allowlist. `remote_start` can only be started with `/remote start`. `app_install` and `app_uninstall` can only come from `/install` and `/uninstall`; the planner never proposes them.
+* `/install` and `/uninstall` run winget only for allow-listed winget IDs, with fixed arguments and no installer overrides. Nothing installs while paused, and success is reported only on exit code 0.
+* `/health` runs read-only PowerShell probes (`Get-*` and `Test-Path` only) through the shared launcher.
 * Paths: UNC and network paths (`\\server\share`, `//server`, `\\?\`, `\??\`), reserved device names (`CON`, `NUL`, `COM1`, `COM¹`, `CONIN$`…) and alternate data streams (`file.txt:stream`) are refused.
 * Uploads: an upload with no size reported by Telegram is refused. Telegram's reported size is checked before download, and the size of the downloaded file is checked again afterwards. Received names are sanitized, the file is written to a temporary name, and a link at the destination is refused.
 * `read_file` refuses every file until `[paths] allowed_roots` lists at least one folder. Once it is set, `read_file` and `send_file` resolve symbolic links and junctions first, then check the real path against the allowed folders.
@@ -172,6 +207,9 @@ The second line downloads the model (not tested in this build). The model folder
 * **Not validated live on Windows:** the PowerShell launch fix (a child Windows PowerShell started from `pwsh`) and its effect on the token-permission step, PowerShell actions, clipboard, process control, DPAPI, screen capture, the banner, the `cloudflared` runtime, live Telegram, the owner-only access list, junctions, the Administrator check on a real elevated process, and `/pause` across a real restart. These were tested with fakes or on Linux. The Windows-only tests in `tests/test_windows_real.py` are the check for them; they run on the GitHub Windows runner.
 * **Access list and other programs.** Removing SYSTEM and Administrators from the token file means a backup or security product that runs as SYSTEM may no longer read it. Your own account still can.
 * **Cloudflared pin:** the default download is `releases/latest`, so the version changes over time. Set `cloudflared_sha256` to pin it.
+* **Trust in winget and the publisher.** An allow-listed app is only as trustworthy as its winget package and publisher. The bot checks the ID and winget's own checks, not the software itself.
+* **UAC is your decision.** The bot never accepts a UAC prompt for you. If you accept one, the installer runs with the rights you granted.
+* **winget and `/health` are not verified live on Windows yet.** The tests use stubs on Linux. `tests/test_windows_real.py` runs `winget --version` and a read-only health probe on a Windows runner, and skips winget when it is missing.
 
 ## Troubleshooting
 
@@ -234,4 +272,4 @@ Delete `token.txt` yourself. Run `main.py --forget-token` to remove the stored t
 python build_zip.py
 ```
 
-`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. `tests/test_windows_real.py` holds the tests that need real Windows (the owner-only access list, the token file, the loopback server, path rules, junctions, log handles, the Administrator check). They skip everywhere else. Run them on a Windows PC or a Windows CI runner. `tests/test_round8.py` covers the Round 8 changes on Linux. `tests/test_powershell_launch.py` covers how PowerShell is started (full path, clean environment, sanitized reasons) with a stubbed `subprocess`, also on Linux. The PowerShell and admin-check test modules are hermetic: `tests/_hermetic.py` makes any real process, network call or real `os.startfile` fail the test, and resets the registered secrets and the PowerShell reason between tests.
+`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. `tests/test_windows_real.py` holds the tests that need real Windows (the owner-only access list, the token file, the loopback server, path rules, junctions, log handles, the Administrator check). They skip everywhere else. Run them on a Windows PC or a Windows CI runner. `tests/test_round8.py` covers the Round 8 changes on Linux. `tests/test_round9_features.py` covers `/health`, the allow-list and the winget runner, with stubbed winget and PowerShell. `tests/test_powershell_launch.py` covers how PowerShell is started (full path, clean environment, sanitized reasons) with a stubbed `subprocess`, also on Linux. The PowerShell and admin-check test modules are hermetic: `tests/_hermetic.py` makes any real process, network call or real `os.startfile` fail the test, and resets the registered secrets and the PowerShell reason between tests.

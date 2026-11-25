@@ -35,7 +35,9 @@ class ActionTests(unittest.TestCase):
         return execute_step(Step(name, params or {}), self.config, **kwargs)
 
     def test_registry_and_risks(self):
-        self.assertEqual(set(HANDLERS), set(VALID_ACTIONS))
+        # Round 9: /install and /uninstall run through HANDLERS, but only from an approved bot plan
+        # (they are not planner actions). Every other handler must be a planner action.
+        self.assertEqual(set(HANDLERS), set(VALID_ACTIONS) | {'app_install', 'app_uninstall'})
         self.assertEqual(set(ACTION_RISK), set(VALID_ACTIONS))
         self.assertEqual(risk_of('scheduled_task'), 'high')
         self.assertEqual(overall_risk(['system_info', 'powershell']), 'high')

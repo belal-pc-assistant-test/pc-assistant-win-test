@@ -464,3 +464,29 @@ class WindowsLinkAndElevationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@ONLY_WINDOWS
+class WingetAndHealthWindowsTests(unittest.TestCase):
+    """Round 9, read-only only: winget --version and the /health probes. Nothing is installed."""
+
+    def test_winget_version_runs_and_exits_zero(self):
+        exe = shutil.which("winget")
+        if exe is None:
+            self.skipTest("winget is not installed on this runner")
+        proc = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=120,
+                              stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0,
+                         msg=f"winget --version exited {proc.returncode}: {(proc.stderr or proc.stdout)[:200]!r}")
+        self.assertRegex(proc.stdout + proc.stderr, r"\d+\.\d+")
+
+    def test_health_probes_return_a_full_report_without_crashing(self):
+        from assistant import health
+        checks = health.run_health()
+        self.assertGreaterEqual(len(checks), 8)
+        self.assertTrue(all(c.status in {health.OK, health.WARN, health.UNKNOWN} for c in checks))
+        user = os.environ.get("USERNAME", "")
+        text = health.render(checks, "en")
+        if user:
+            self.assertNotIn(user, text)
+        self.assertNotIn("\\Users\\", text)
