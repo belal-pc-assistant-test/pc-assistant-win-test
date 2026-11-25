@@ -41,7 +41,7 @@ EXPECTED_IDS = {
     "7zip": "7zip.7zip", "vlc": "VideoLAN.VLC", "notepadpp": "Notepad++.Notepad++",
     "git": "Git.Git", "python": "Python.Python.3.13", "chrome": "Google.Chrome",
     "firefox": "Mozilla.Firefox", "vscode": "Microsoft.VisualStudioCode", "zoom": "Zoom.Zoom",
-    "whatsapp": "WhatsApp.WhatsApp", "telegram": "Telegram.TelegramDesktop",
+    "telegram": "Telegram.TelegramDesktop",
 }
 
 
@@ -57,7 +57,9 @@ class AllowlistTests(IsolatedCase):
 
     def test_builtin_list_has_exactly_the_agreed_apps_and_ids(self):
         builtin = app_allowlist.load_builtin()
+        self.assertEqual(len(builtin), 10)
         self.assertEqual({k: v["id"] for k, v in builtin.items()}, EXPECTED_IDS)
+        self.assertNotIn("whatsapp", builtin, "WhatsApp is Microsoft Store only, not in the winget source")
 
     def test_every_builtin_id_is_a_valid_winget_id(self):
         for name, entry in app_allowlist.load_builtin().items():
@@ -613,6 +615,11 @@ class AppCommandFlowTests(IsolatedCase):
         self._send("cmd_install", "/install VLC", ["VLC"])
         self.assertEqual(len(self._plans("app_install")), 1)
 
+    def test_whatsapp_is_refused_because_it_is_store_only(self):
+        message = self._send("cmd_install", "/install whatsapp", ["whatsapp"])
+        self.assertEqual(self._plans(), [])
+        self.assertIn("allow-list", message.replies[-1])
+
     def test_unlisted_name_is_refused_and_names_the_allow_list(self):
         message = self._send("cmd_install", "/install evil", ["evil"])
         self.assertEqual(self._plans(), [])
@@ -717,6 +724,17 @@ class ReadmeRound9Tests(IsolatedCase):
 
     def test_arabic_quick_start_still_exists(self):
         self.assertIn("## البدء السريع", self.readme)
+
+    def test_readme_says_store_only_apps_are_not_supported(self):
+        self.assertIn("Microsoft Store apps are not supported", self.readme)
+        self.assertIn("msstore", self.readme)
+
+    def test_whatsapp_is_gone_from_every_shipped_file(self):
+        shipped = [PROJECT_DIR / "README.md", PROJECT_DIR / "config.example.ini",
+                   PROJECT_DIR / "assistant" / "data" / "app_allowlist.json"]
+        shipped += sorted((PROJECT_DIR / "assistant").rglob("*.py"))
+        for path in shipped:
+            self.assertNotIn("whatsapp", path.read_text(encoding="utf-8").lower(), path.name)
 
 
 if __name__ == "__main__":

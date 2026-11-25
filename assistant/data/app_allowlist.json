@@ -10,7 +10,6 @@
     "firefox": {"id": "Mozilla.Firefox", "title": "Mozilla Firefox"},
     "vscode": {"id": "Microsoft.VisualStudioCode", "title": "Visual Studio Code"},
     "zoom": {"id": "Zoom.Zoom", "title": "Zoom Workplace"},
-    "whatsapp": {"id": "WhatsApp.WhatsApp", "title": "WhatsApp Desktop"},
     "telegram": {"id": "Telegram.TelegramDesktop", "title": "Telegram Desktop"}
   }
 }
