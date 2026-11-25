@@ -147,7 +147,7 @@ The second line downloads the model (not tested in this build). The model folder
 * Planner output must match the schema and an action allowlist. `remote_start` can only be started with `/remote start`.
 * Paths: UNC and network paths (`\\server\share`, `//server`, `\\?\`, `\??\`), reserved device names (`CON`, `NUL`, `COM1`, `COM¹`, `CONIN$`…) and alternate data streams (`file.txt:stream`) are refused.
 * Uploads: Telegram's declared size is checked before download. Received names are sanitized, and the file is written to a temporary name.
-* File actions refuse the protected names `token.json`, `token.txt` and `.env`, including the same names with trailing dots or spaces and the 8.3 short form `TOKEN~1.TXT`. Writes to the Windows Startup folder are refused. The token is never written to `config.ini` or to plans, and the audit log removes it. It is not removed from chat messages, so never paste the token into the chat.
+* File actions refuse the protected names `token.json`, `token.txt` and `.env`, including the same names with trailing dots or spaces and the 8.3 short form `TOKEN~1.TXT`. Writes to the Windows Startup folder are refused. The token is never written to `config.ini` or to plans. Every message the bot sends to Telegram (replies, errors, edited text and captions) has the token replaced with `[REDACTED]`, and a file that contains the token is not sent. The audit log removes it too. Text you type to the bot is kept as you sent it, so never paste the token into the chat.
 * Clipboard text and notification text reach PowerShell encoded as base64, not pasted into the script.
 * Remote: the link secret is at least 32 random bytes and new for each session. Failed attempts are rate-limited: 5 failures in 60 seconds cause a 60-second lockout, and 25 failures in total end the session. Host and Origin headers are checked on every request. Input is accepted only after a viewer authenticates.
 * The `cloudflared` download uses only the official `github.com/cloudflare/cloudflared/releases/` path, caps its size, and runs `cloudflared --version` before use.
@@ -216,4 +216,4 @@ Delete `token.txt` yourself. Run `main.py --forget-token` to remove the stored t
 python build_zip.py
 ```
 
-`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. The Windows-only parts above still need a run on a real Windows PC.
+`build_zip.py` builds the release ZIP from an explicit allowlist. It excludes `token.txt`, `config.ini`, token stores and runtime folders. The tests run on Linux, with fakes for the Windows APIs, tunnels and capture. `tests/test_windows_real.py` holds the tests that need real Windows (icacls, the token file, the loopback server, path rules, log handles). They skip everywhere else. Run them on a Windows PC or a Windows CI runner.

@@ -22,9 +22,11 @@ class ReadmeClaimTests(unittest.TestCase):
         self.assertIn(">=12,<16", README)
 
     def test_token_claim_matches_the_code(self):
-        # The code redacts the token from the audit log only; chat messages are not redacted.
+        # Round 7: outgoing Telegram messages and captions are redacted at one choke point.
         self.assertIn("never written to `config.ini` or to plans", README)
+        self.assertIn("replaced with `[REDACTED]`", README)
         self.assertIn("never paste the token into the chat", README)
+        self.assertNotIn("It is not removed from chat messages", README)
         self.assertNotIn("never written to `config.ini`, plans or Telegram messages", README)
 
     def test_startup_retry_is_documented(self):

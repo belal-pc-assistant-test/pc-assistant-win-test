@@ -18,6 +18,10 @@ def build_zip(root: Path, output: Path) -> None:
     sources += sorted((root / "assistant").rglob("*.py"))
     sources += sorted((root / "tests").glob("test_*.py"))
     sources += sorted((root / "tests").glob("_*.py"))  # shared test helpers (no secrets)
+    # CI workflow for the Windows-only tests (no secrets; it runs on a GitHub Windows runner).
+    workflow = root / ".github" / "workflows" / "windows-tests.yml"
+    if workflow.is_file():
+        sources.append(workflow)
     # Guard against accidentally pasting the current local bot token into a
     # source file. Never print the token, even if packaging is refused.
     secrets = []

@@ -58,6 +58,7 @@ from .planner import Plan, Planner, Step
 from .plan_code import fingerprint, normalize_code, unique_code
 from .scheduler import scheduler_loop
 from .memory import MemoryStore, language_for, NAME_RE
+from .outbound import RedactingHTTPXRequest
 from .voice import transcribe, VoiceUnavailable, MAX_VOICE_BYTES, MAX_VOICE_SECONDS
 from .sharing import (ScreenIndicator, WatchController, CaptureLease, capture_frame, photo_stream, foreground_window_handle,
                       MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL, DEFAULT_MINUTES, MAX_MINUTES)
@@ -1906,10 +1907,16 @@ async def _post_shutdown(application: Application) -> None:
 
 def build_application(config: Config) -> Application:
     planner = Planner.from_config(config)
+    # Every message the bot sends passes the outbound redaction in assistant/outbound.py.
+    # The token is registered here as well, so that holds even if the config was built
+    # without the loader that normally registers it.
+    audit.register_secret(config.bot_token)
 
     application = (
         Application.builder().concurrent_updates(True)
         .token(config.bot_token)
+        .request(RedactingHTTPXRequest(connection_pool_size=256))
+        .get_updates_request(RedactingHTTPXRequest(connection_pool_size=1))
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()

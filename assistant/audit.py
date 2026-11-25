@@ -32,6 +32,11 @@ def redact_secret(text: str) -> str:
     return text
 
 
+def registered_secrets() -> tuple[str, ...]:
+    """The secrets that :func:`redact_secret` removes (read-only snapshot)."""
+    return tuple(_secrets)
+
+
 class SafeFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         # Format exception tracebacks first so secrets are also removed there.
