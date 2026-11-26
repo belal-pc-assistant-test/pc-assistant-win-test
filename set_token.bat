@@ -6,6 +6,7 @@ title Telegram PC Assistant - Bot token
 
 if not exist ".venv\Scripts\python.exe" (
     echo [X] Run install.bat first.
+    echo بالعربية: شغّل install.bat أولًا.
     pause
     exit /b 1
 )

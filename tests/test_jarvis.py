@@ -97,7 +97,7 @@ class JarvisFlows(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.pending().plan.steps), 2)
         self.assertFalse(a.exists()); self.assertFalse(b.exists())
         await self.approve()
-        self.assertEqual(a.read_text(), 'A'); self.assertEqual(b.read_text(), 'B')
+        self.assertEqual(a.read_text(encoding='utf-8'), 'A'); self.assertEqual(b.read_text(encoding='utf-8'), 'B')
 
     async def test_chain_proposes_multiple_steps_without_running(self):
         await self.run_command(bot.cmd_chain, ['open', 'chrome', ';', 'take', 'a', 'screenshot'])
@@ -223,7 +223,7 @@ class JarvisFlows(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.root/'cloud.txt').exists())
         self.assertEqual(self.pending().plan.steps[0].action, 'write_file')
         await self.approve()
-        self.assertEqual((self.root/'cloud.txt').read_text(), 'ok')
+        self.assertEqual((self.root/'cloud.txt').read_text(encoding='utf-8'), 'ok')
 
     async def test_panic_discards_an_inflight_external_plan(self):
         import asyncio
@@ -365,8 +365,8 @@ class ReleaseSafetyTests(unittest.TestCase):
             source = Path(__file__).resolve().parent.parent
             shutil.copytree(source, root, ignore=shutil.ignore_patterns('__pycache__', '.venv', 'token.txt', 'data', 'models', 'logs', 'downloads', 'screenshots'))
             token = '909090:AAHsecret_' + os.urandom(24).hex()
-            (root / 'token.txt').write_text(token)
-            with (root / 'README.md').open('a') as file:
+            (root / 'token.txt').write_text(token, encoding='utf-8')
+            with (root / 'README.md').open('a', encoding='utf-8') as file:
                 file.write(token)
             archive = Path(tmp) / 'release.zip'
             archive.write_bytes(b'old')

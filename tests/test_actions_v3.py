@@ -133,7 +133,7 @@ class ActionTests(unittest.TestCase):
         self.assertFalse(result.ok); self.assertFalse(list(self.config.downloads_dir.glob('*.part')))
 
     def test_find_files_and_url_guard(self):
-        (self.root / 'example.pdf').write_text('ok')
+        (self.root / 'example.pdf').write_text('ok', encoding='utf-8')
         self.assertIn('example.pdf', self.run_action('find_files', {'ext':'pdf'}).output)
         self.assertFalse(self.run_action('find_files', {'root':str(self.root.parent)}).ok)
         with patch('assistant.actions.core._open_external') as op:
@@ -202,7 +202,7 @@ class SeparationTests(unittest.IsolatedAsyncioTestCase):
     async def test_external_approver_can_use_code(self):
         msg = FakeMessage('approve ' + self.pending.code)
         await bot.on_text(make_update(message=msg, user_id=43), self.context)
-        self.assertEqual(self.path.read_text(), 'ok')
+        self.assertEqual(self.path.read_text(encoding='utf-8'), 'ok')
 
     async def test_external_approver_can_use_button(self):
         query = FakeQuery('apv:' + self.pending.plan_id, 43)

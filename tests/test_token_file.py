@@ -131,7 +131,7 @@ class TokenFileTests(unittest.TestCase):
         self.assertIn('[REDACTED]', output.getvalue())
 
     def test_installer_does_not_prompt_when_file_exists(self):
-        script = (Path(__file__).resolve().parent.parent / 'install.bat').read_text()
+        script = (Path(__file__).resolve().parent.parent / 'install.bat').read_text(encoding='utf-8')
         # The interactive prompt is a set /p read (EOF-safe; choice could hang
         # with stdin closed), and token.txt must short-circuit before it.
         prompt_marker = 'set /p "SAVE_TOKEN='
@@ -144,7 +144,7 @@ class TokenFileTests(unittest.TestCase):
         root = self.root / 'project'
         shutil.copytree(Path(__file__).resolve().parent.parent, root, ignore=shutil.ignore_patterns('__pycache__', '.venv', 'token.txt', 'config.ini', 'logs', 'data', 'downloads', 'screenshots'))
         secret = '987654:AAHunique_' + os.urandom(24).hex()
-        (root / 'token.txt').write_text(secret)
+        (root / 'token.txt').write_text(secret, encoding='utf-8')
         archive = self.root / 'out.zip'
         with patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': ''}):
             build_zip(root, archive)

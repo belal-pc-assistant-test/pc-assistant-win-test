@@ -625,7 +625,7 @@ class CloudPrivacyTests(unittest.TestCase):
 
 class DependencyPinTests(unittest.TestCase):
     def test_every_runtime_requirement_is_pinned_exactly(self):
-        lines = [line.strip() for line in (PROJECT_DIR / "requirements.txt").read_text().splitlines()]
+        lines = [line.strip() for line in (PROJECT_DIR / "requirements.txt").read_text(encoding='utf-8').splitlines()]
         requirements = [line for line in lines if line and not line.startswith("#")]
         self.assertTrue(requirements)
         for requirement in requirements:

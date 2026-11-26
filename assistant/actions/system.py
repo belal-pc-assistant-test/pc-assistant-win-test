@@ -315,7 +315,7 @@ def kill_process(params: dict[str, str], ctx: ActionContext) -> ActionResult:
                 raise ActionError("Refused: could not resolve PID to a process name.")
         else:
             try:
-                process_name = Path(f"/proc/{pid}/comm").read_text().strip()
+                process_name = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
             except OSError:
                 raise ActionError("Refused: could not resolve PID to a process name.") from None
         if is_protected_process(process_name, config):

@@ -474,8 +474,8 @@ class WingetAndHealthWindowsTests(unittest.TestCase):
         exe = shutil.which("winget")
         if exe is None:
             self.skipTest("winget is not installed on this runner")
-        proc = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=120,
-                              stdin=subprocess.DEVNULL)
+        proc = subprocess.run([exe, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=120, stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0,
                          msg=f"winget --version exited {proc.returncode}: {(proc.stderr or proc.stdout)[:200]!r}")
         self.assertRegex(proc.stdout + proc.stderr, r"\d+\.\d+")

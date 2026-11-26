@@ -31,11 +31,13 @@ echo.
 if "%EXITCODE%"=="4" (
     echo Telegram rejected the bot token - save a fresh one with:
     echo     .venv\Scripts\python.exe main.py --set-token
+    echo بالعربية: رفض Telegram رمز البوت. احفظ رمزًا جديدًا بالأمر أعلاه.
     echo.
 )
 if "%EXITCODE%"=="3" (
     echo No bot token available - save one with:
     echo     .venv\Scripts\python.exe main.py --set-token
+    echo بالعربية: لا يوجد رمز بوت. احفظ رمزًا بالأمر أعلاه.
     echo.
 )
 echo Assistant stopped (exit code %EXITCODE%).
