@@ -48,6 +48,7 @@ OTHER_ID = 43
 
 
 def make_config(tmp: Path, ids: str = str(OWNER_ID), approvers: str | None = None, distinct: bool = False):
+    tmp.mkdir(parents=True, exist_ok=True)  # callers may pass a folder that does not exist yet
     cfg = tmp / "config.ini"
     body = (
         "[telegram]\n"

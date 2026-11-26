@@ -18,6 +18,8 @@ The Windows-only counterparts (NTFS, junctions, locked files, ``taskkill``) are 
 
 from __future__ import annotations
 
+import asyncio
+import os
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,7 @@ from test_flow import make_config  # noqa: E402  (shared fakes; also sets a priv
 from _hermetic import IsolatedCase, release_log_then_remove  # noqa: E402
 
 from assistant import audit  # noqa: E402
+from assistant import bot as botmod  # noqa: E402
 from assistant.actions import base, core as core_mod, system as system_mod  # noqa: E402
 from assistant.actions import transfer as transfer_mod  # noqa: E402
 from assistant.actions.base import ActionContext, ActionError  # noqa: E402
@@ -202,11 +205,16 @@ class FileErrorTests(_Workspace):
         self.assertIn("File not found", str(caught.exception))
 
     def test_locked_file_in_send_file_gives_a_short_reason(self):
+        # Patched, not locked: send_file only reads metadata, so a real share-0 lock
+        # would not make it fail. Real locks are tested on Windows (test_windows_real).
+        # The comparison uses realpath, because send_file reports the normalized path
+        # (8.3 short names expanded on Windows), which need not equal the raw path.
         target = self.ws / "notes.txt"
         real_stat = Path.stat
+        target_key = os.path.normcase(os.path.realpath(target))
 
         def denied_for_target(path_self, *args, **kwargs):
-            if path_self == target:
+            if os.path.normcase(os.path.realpath(path_self)) == target_key:
                 raise PermissionError(13, "Permission denied", str(target))
             return real_stat(path_self, *args, **kwargs)
 
@@ -274,6 +282,33 @@ TRACEBACK_TEXT = (
     '  File "C:\\Users\\Alice\\app\\clip.py", line 3, in <module>\n'
     'RuntimeError: clipboard is busy\n'
 )
+
+
+class UploadErrorTests(unittest.TestCase):
+    """The bot's upload step (_send_file) must not echo the raw OS error with the full path."""
+
+    def test_a_file_that_cannot_be_opened_for_upload_names_only_the_file(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name) / "private folder"
+        folder.mkdir()
+        target = folder / "report.txt"
+        target.write_text("x", encoding="utf-8")
+        config = make_config(Path(tmp.name) / "cfg")
+        sent: list[str] = []
+
+        async def fake_send_long(bot, chat_id, text, **kwargs):
+            sent.append(text)
+
+        error = PermissionError(13, "Permission denied", str(target))
+        with mock.patch.object(Path, "open", side_effect=error), \
+                mock.patch.object(botmod, "send_long", side_effect=fake_send_long):
+            asyncio.run(botmod._send_file(object(), 1, target, True, config))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("report.txt", sent[0])
+        self.assertIn("access was denied", sent[0])
+        self.assertNotIn("Errno", sent[0])
+        self.assertNotIn(str(folder), sent[0])
 
 
 class ClipboardErrorTests(unittest.TestCase):

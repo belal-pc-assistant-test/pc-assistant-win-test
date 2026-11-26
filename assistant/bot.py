@@ -56,7 +56,7 @@ from .action_spec import (
 )
 from .actions import execute_step, request_abort, clear_abort, abort_requested
 from .actions.apps import winget_path
-from .actions.base import REGISTRY, sanitize_filename, unique_destination, ActionResult
+from .actions.base import REGISTRY, sanitize_filename, unique_destination, ActionResult, os_error_reason
 from .config import Config
 from .jobs import JobStore
 from .planner import Plan, Planner, Step
@@ -1434,8 +1434,14 @@ async def _send_file(bot: Any, chat_id: int, path: Path, as_document: bool,
                 await bot.send_photo(chat_id=chat_id, photo=handle)
     except (OSError, TelegramError) as exc:
         audit.warning("Could not send file", path=str(path), error=str(exc))
-        await send_long(bot, chat_id, f"⚠️ Could not attach {_esc(str(path))}: {_esc(str(exc))}",
-                        parse_mode=ParseMode.HTML)
+        if isinstance(exc, OSError):
+            # A locked or unreadable file: name the file only, and give a short reason
+            # (the raw OS error carries the full path).
+            text = (f"⚠️ Could not attach {_esc(path.name)}: "
+                    f"could not read the file: {_esc(os_error_reason(exc))}.")
+        else:
+            text = f"⚠️ Could not attach {_esc(str(path))}: {_esc(str(exc))}"
+        await send_long(bot, chat_id, text, parse_mode=ParseMode.HTML)
         return
     finally:
         # Legacy defensive cleanup: screenshot actions now use memory only.

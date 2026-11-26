@@ -30,6 +30,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from _bootstrap import PROJECT_DIR
 assert PROJECT_DIR.is_dir()
@@ -44,6 +45,8 @@ from assistant.actions import system as system_mod  # noqa: E402
 from assistant.actions import transfer as transfer_mod  # noqa: E402
 from assistant.actions.base import ActionContext  # noqa: E402
 from test_flow import make_config  # noqa: E402
+from _hermetic import release_log_then_remove  # noqa: E402
+from assistant import bot as botmod  # noqa: E402
 from test_round11_quality import (GRANDCHILD_SRC, PARENT_SRC, assert_stopped,  # noqa: E402
                                   wait_for)
 from assistant.remote.gate import AccessGate, generate_secret  # noqa: E402
@@ -529,6 +532,17 @@ def _hold_exclusive(path: Path):
     return handle, release
 
 
+def _inside_by_realpath(path: Path, root: Path) -> bool:
+    """Containment checked with os.path.realpath, not the product's normalize_path.
+
+    realpath expands 8.3 short names on Windows, so a short-form temp folder and the
+    long-form path the product reports compare equal. Independent of the code under test.
+    """
+    real_path = os.path.normcase(os.path.realpath(path))
+    real_root = os.path.normcase(os.path.realpath(root))
+    return real_path == real_root or real_path.startswith(real_root.rstrip("\\/") + os.sep)
+
+
 class _FakeTransport:
     """Stands in for Telegram: writes a fixed payload where the bot would download it."""
 
@@ -567,7 +581,7 @@ class _NtfsFixture(unittest.TestCase):
         except ActionError:
             return
         first_line = result.output.splitlines()[0]
-        self.assertTrue(path_is_inside(Path(first_line), self.ws),
+        self.assertTrue(_inside_by_realpath(Path(first_line), self.ws),
                         f"{raw!r} read {first_line!r}, outside the allowed folder")
         self.assertNotIn(self.SECRET, result.output)
 
@@ -587,8 +601,9 @@ class WindowsNtfsFileTests(_NtfsFixture):
         deep = self.ws
         for index in range(12):
             deep = deep / f"segment long name {index:02d} for the test"
-        os.makedirs("\\\\?\\" + str(deep))  # extended-length prefix, so the folders can be made
-        (deep / "far.txt").write_text("far away", encoding="utf-8")
+        # The extended-length prefix is needed to create folders past MAX_PATH here.
+        os.makedirs("\\\\?\\" + str(deep))
+        Path("\\\\?\\" + str(deep / "far.txt")).write_text("far away", encoding="utf-8")
         self.assertGreater(len(str(deep / "far.txt")), 260)
         try:
             result = core_mod.read_file({"path": str(deep / "far.txt")}, self.ctx)
@@ -661,6 +676,26 @@ class WindowsNtfsFileTests(_NtfsFixture):
         self.assertIn("access was denied", message)
         self.assertNotIn("Errno", message)
 
+    def test_a_locked_file_passes_send_file_and_fails_at_upload_with_a_short_reason(self):
+        """send_file only reads metadata, so a lock does not stop it; the upload step opens the file."""
+        target = self.ws / "upload.txt"
+        target.write_text("upload me", encoding="utf-8")
+        self.assertTrue(transfer_mod.send_file({"path": str(target)}, self.ctx).ok)
+        _handle, release = _hold_exclusive(target)
+        self.addCleanup(release)
+        sent: list[str] = []
+
+        async def capture(bot, chat_id, text, **kwargs):
+            sent.append(text)
+
+        with mock.patch.object(botmod, "send_long", side_effect=capture):
+            asyncio.run(botmod._send_file(object(), 1, target, True, self.config))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("upload.txt", sent[0])
+        self.assertIn("access was denied", sent[0])
+        self.assertNotIn("Errno", sent[0])
+        self.assertNotIn(str(self.ws), sent[0])
+
     def test_junction_escape_is_refused_for_read_send_and_receive(self):
         junction = self.ws / "linked folder"
         _make_junction(junction, self.outside)
@@ -700,8 +735,15 @@ class WindowsEscapeAttemptTests(_NtfsFixture):
         self._assert_refused_or_inside("%TPA_R11_OUTSIDE%/secret.txt")
 
     def test_home_shorthand_is_expanded_then_checked(self):
-        self._assert_refused_or_inside("~\\secret.txt")
-        self._assert_refused_or_inside("~\\..\\outside folder\\secret.txt")
+        # Point the home folder at a real secret outside the allowed folder, so "~" really
+        # reaches a readable file that must be refused.
+        home = self.root / "home folder"
+        home.mkdir()
+        (home / "secret.txt").write_text(self.SECRET, encoding="utf-8")
+        with mock.patch.dict(os.environ, {"USERPROFILE": str(home), "HOME": str(home)}):
+            self._assert_refused_or_inside("~\\secret.txt")
+            self._assert_refused_or_inside("~/secret.txt")
+            self._assert_refused_or_inside("~\\..\\home folder\\secret.txt")
 
     def test_trailing_dots_and_spaces_on_the_escape_are_refused_or_inside(self):
         for raw in ("..\\outside folder\\secret.txt.", "..\\outside folder\\secret.txt "):
@@ -724,6 +766,10 @@ class WindowsProcessTests(unittest.TestCase):
         (self.dir / "grand.py").write_text(GRANDCHILD_SRC, encoding="utf-8")
 
     def test_timeout_kills_a_grandchild_started_through_cmd(self):
+        # cmd /c mangles quoted arguments, so this needs paths with no spaces. The CI
+        # runner's Python and temp folders have none; elsewhere the test says so.
+        if any(" " in part for part in (sys.executable, str(self.dir))):
+            self.skipTest("cmd /c needs paths without spaces (quoting)")
         argv = ["cmd", "/c", sys.executable, str(self.dir / "parent.py"),
                 str(self.heartbeat), str(self.dir / "grand.py")]
         outcome: dict[str, object] = {}
@@ -765,9 +811,9 @@ class WindowsLogFileTests(unittest.TestCase):
 
     def setUp(self) -> None:
         audit.close()
-        self.addCleanup(audit.close)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(tmp.cleanup)
+        # Closes the log, then removes the folder: the order matters on Windows.
+        self.addCleanup(release_log_then_remove, tmp)
         self.dir = Path(tmp.name)
         self.log = self.dir / "logs" / "a.log"
 
