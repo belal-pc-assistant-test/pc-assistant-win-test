@@ -315,7 +315,9 @@ class VoiceAndAuditTests(unittest.TestCase):
         from assistant.planner import LocalPlanner
         response = SimpleNamespace(raise_for_status=lambda: None,
             json=lambda: {'message': {'content': '{"summary":"x","steps":[{"action":"reply","params":{"text":"hi"}}]}'}})
-        with patch('requests.post', return_value=response) as post:
+        # Both HTTP verbs are stubbed, so no socket is opened on any platform.
+        with patch('requests.post', return_value=response) as post, \
+                patch('requests.get', side_effect=AssertionError('no real Ollama call in tests')):
             LocalPlanner('http://127.0.0.1:11434', 'example').plan('hello', Path('.'))
         self.assertEqual(post.call_args.kwargs['proxies'], {'http':'', 'https':''})
         self.assertFalse(post.call_args.kwargs['allow_redirects'])

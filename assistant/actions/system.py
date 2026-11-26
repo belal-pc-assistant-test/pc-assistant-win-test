@@ -512,6 +512,7 @@ def _clipboard_write(text: str) -> None:
         if proc.returncode != 0:
             raise ActionError(f"Could not write the clipboard: {sanitize_failure(proc.stderr, 200)}")
         return
+    timed_out = False
     for tool in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"],
                  ["pbcopy"]):
         if shutil.which(tool[0]):
@@ -520,10 +521,15 @@ def _clipboard_write(text: str) -> None:
                     tool, input=text, text=True, encoding="utf-8",
                     capture_output=True, timeout=15,
                 )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                continue
             except OSError:
                 continue
             if proc.returncode == 0:
                 return
+    if timed_out:
+        raise ActionError("The clipboard tool did not respond in time.")
     raise ActionError("No clipboard tool available (xclip/xsel/pbcopy).")
 
 

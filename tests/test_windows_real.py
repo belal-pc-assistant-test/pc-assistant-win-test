@@ -22,8 +22,11 @@ import locale
 import logging
 import os
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -35,6 +38,14 @@ from assistant import audit, token_store  # noqa: E402
 from assistant.actions.base import (ActionError, STARTUP_FOLDER_MARKER,  # noqa: E402
                                     check_path_syntax, ensure_not_protected)
 from assistant.config import normalize_path, path_is_inside  # noqa: E402
+from assistant.actions import base as action_base  # noqa: E402
+from assistant.actions import core as core_mod  # noqa: E402
+from assistant.actions import system as system_mod  # noqa: E402
+from assistant.actions import transfer as transfer_mod  # noqa: E402
+from assistant.actions.base import ActionContext  # noqa: E402
+from test_flow import make_config  # noqa: E402
+from test_round11_quality import (GRANDCHILD_SRC, PARENT_SRC, assert_stopped,  # noqa: E402
+                                  wait_for)
 from assistant.remote.gate import AccessGate, generate_secret  # noqa: E402
 from assistant.remote.server import COOKIE_NAME, RemoteServer  # noqa: E402
 from assistant.remote.stream import FrameBroker  # noqa: E402
@@ -462,9 +473,6 @@ class WindowsLinkAndElevationTests(unittest.TestCase):
         self.assertTrue(token_store.acl_is_owner_only(token_store.windows_acl_report(folder), sid))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 @ONLY_WINDOWS
 class WingetAndHealthWindowsTests(unittest.TestCase):
@@ -490,3 +498,300 @@ class WingetAndHealthWindowsTests(unittest.TestCase):
         if user:
             self.assertNotIn(user, text)
         self.assertNotIn("\\Users\\", text)
+
+
+# ---------------------------------------------------------------------------
+# Round 11: NTFS file edge cases, escape attempts, subprocess trees, logs.
+# Never touches the clipboard, screen, keyboard or mouse (Round 7 rule).
+# ---------------------------------------------------------------------------
+
+def _hold_exclusive(path: Path):
+    """Open ``path`` with no sharing, the way a program that locks a file does.
+
+    Returns ``(handle, release)``. Call ``release()`` before the folder is removed.
+    """
+    import ctypes
+    from ctypes import wintypes
+    generic_read, open_existing, normal = 0x80000000, 3, 0x80
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    handle = kernel32.CreateFileW(str(path), generic_read, 0, None, open_existing, normal, None)
+    invalid = ctypes.c_void_p(-1).value
+    if not handle or handle == invalid:
+        raise OSError(ctypes.get_last_error(), f"could not lock {path.name}")
+
+    def release() -> None:
+        kernel32.CloseHandle(handle)
+
+    return handle, release
+
+
+class _FakeTransport:
+    """Stands in for Telegram: writes a fixed payload where the bot would download it."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def download_file(self, file_id: str, destination: Path) -> int:
+        destination.write_bytes(self.payload)
+        return len(self.payload)
+
+
+class _NtfsFixture(unittest.TestCase):
+    """A real NTFS workspace with a secret folder outside it. Holds no tests."""
+
+    SECRET = "TOP SECRET CONTENT"
+
+    def setUp(self) -> None:
+        self.root = _new_folder("tpa ntfs")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.ws = self.root / ARABIC_FOLDER / "workspace"
+        self.ws.mkdir(parents=True)
+        self.outside = self.root / "outside folder"
+        self.outside.mkdir()
+        self.secret = self.outside / "secret.txt"
+        self.secret.write_text(self.SECRET, encoding="utf-8")
+        (self.ws / "notes.txt").write_text("hello notes", encoding="utf-8")
+        self.config = make_config(self.root / "cfg")
+        self.config.allowed_roots = [self.ws]
+        self.config.workspace_root = self.ws
+        self.config.downloads_dir = self.ws / "downloads"
+        self.ctx = ActionContext(config=self.config)
+
+    def _assert_refused_or_inside(self, raw: str) -> None:
+        try:
+            result = core_mod.read_file({"path": raw}, self.ctx)
+        except ActionError:
+            return
+        first_line = result.output.splitlines()[0]
+        self.assertTrue(path_is_inside(Path(first_line), self.ws),
+                        f"{raw!r} read {first_line!r}, outside the allowed folder")
+        self.assertNotIn(self.SECRET, result.output)
+
+@ONLY_WINDOWS
+class WindowsNtfsFileTests(_NtfsFixture):
+    """read_file, send_file and receive_file on a real NTFS folder."""
+
+    def test_spaces_and_arabic_names_are_read(self):
+        folder = self.ws / "مجلد فرعي بمسافات"
+        folder.mkdir()
+        name = folder / "ملف عربي 1.txt"
+        name.write_text("نص عربي", encoding="utf-8")
+        result = core_mod.read_file({"path": str(name)}, self.ctx)
+        self.assertIn("نص عربي", result.output)
+
+    def test_a_path_over_260_characters_is_read_or_refused_cleanly(self):
+        deep = self.ws
+        for index in range(12):
+            deep = deep / f"segment long name {index:02d} for the test"
+        os.makedirs("\\\\?\\" + str(deep))  # extended-length prefix, so the folders can be made
+        (deep / "far.txt").write_text("far away", encoding="utf-8")
+        self.assertGreater(len(str(deep / "far.txt")), 260)
+        try:
+            result = core_mod.read_file({"path": str(deep / "far.txt")}, self.ctx)
+        except ActionError:
+            return  # refused: acceptable when long-path support is off
+        self.assertIn("far away", result.output)
+
+    def test_device_names_are_refused_before_anything_is_opened(self):
+        for name in ("CON", "nul", "COM1", "LPT1.txt", "aux.log"):
+            with self.subTest(name=name):
+                with self.assertRaises(ActionError):
+                    check_path_syntax(str(self.ws / name), "File path")
+                with self.assertRaises(ActionError):
+                    core_mod.read_file({"path": str(self.ws / name)}, self.ctx)
+
+    def test_trailing_dot_or_space_resolves_inside_or_is_refused(self):
+        (self.ws / "real.txt").write_text("REAL", encoding="utf-8")
+        for raw in (str(self.ws / "real.txt."), str(self.ws / "real.txt ")):
+            with self.subTest(raw=raw):
+                self._assert_refused_or_inside(raw)
+
+    def test_alternate_data_stream_is_refused(self):
+        stream = str(self.ws / "notes.txt") + ":hidden"
+        (self.ws / "notes.txt:hidden").write_text("stream text", encoding="utf-8")
+        with self.assertRaises(ActionError):
+            core_mod.read_file({"path": stream}, self.ctx)
+
+    def test_unc_path_is_refused_without_a_network_lookup(self):
+        with self.assertRaises(ActionError) as caught:
+            core_mod.read_file({"path": r"\\server\share\x.txt"}, self.ctx)
+        self.assertIn("UNC", str(caught.exception))
+
+    def test_drive_relative_path_is_refused_or_inside(self):
+        self._assert_refused_or_inside("C:notes.txt")
+
+    def test_an_8_3_short_name_inside_the_roots_is_read(self):
+        (self.ws / "short name file.txt").write_text("short ok", encoding="utf-8")
+        short = _short_path(str(self.ws / "short name file.txt"))
+        if short == str(self.ws / "short name file.txt"):
+            self.skipTest("this volume has no 8.3 short names")
+        result = core_mod.read_file({"path": short}, self.ctx)
+        self.assertIn("short ok", result.output)
+
+    def test_case_differences_match_the_allowed_folder(self):
+        self.config.allowed_roots = [Path(str(self.ws).upper())]
+        result = core_mod.read_file({"path": str(self.ws).lower() + "\\notes.txt"}, self.ctx)
+        self.assertIn("hello notes", result.output)
+
+    def test_forward_and_back_slashes_both_work(self):
+        for raw in (str(self.ws / "notes.txt"), str(self.ws / "notes.txt").replace("\\", "/")):
+            with self.subTest(raw=raw):
+                self.assertIn("hello notes", core_mod.read_file({"path": raw}, self.ctx).output)
+
+    def test_a_read_only_file_can_still_be_read_and_sent(self):
+        target = self.ws / "readonly.txt"
+        target.write_text("read only text", encoding="utf-8")
+        os.chmod(target, stat.S_IREAD)
+        self.addCleanup(os.chmod, target, stat.S_IREAD | stat.S_IWRITE)
+        self.assertIn("read only text", core_mod.read_file({"path": str(target)}, self.ctx).output)
+        self.assertTrue(transfer_mod.send_file({"path": str(target)}, self.ctx).ok)
+
+    def test_a_file_locked_by_another_process_gives_a_short_reason(self):
+        target = self.ws / "locked.txt"
+        target.write_text("locked", encoding="utf-8")
+        _handle, release = _hold_exclusive(target)
+        self.addCleanup(release)  # registered after the folder cleanup, so it runs first
+        with self.assertRaises(ActionError) as caught:
+            core_mod.read_file({"path": str(target)}, self.ctx)
+        message = str(caught.exception)
+        self.assertIn("access was denied", message)
+        self.assertNotIn("Errno", message)
+
+    def test_junction_escape_is_refused_for_read_send_and_receive(self):
+        junction = self.ws / "linked folder"
+        _make_junction(junction, self.outside)
+        with self.assertRaises(ActionError):
+            core_mod.read_file({"path": str(junction / "secret.txt")}, self.ctx)
+        with self.assertRaises(ActionError):
+            transfer_mod.send_file({"path": str(junction / "secret.txt")}, self.ctx)
+        receive_ctx = ActionContext(config=self.config, transport=_FakeTransport(b"payload"))
+        with self.assertRaises(ActionError):
+            transfer_mod.receive_file({"file_id": "abc", "size": "7",
+                                       "target": "linked folder\\new.txt"}, receive_ctx)
+        self.assertFalse((self.outside / "new.txt").exists())
+
+
+@ONLY_WINDOWS
+class WindowsEscapeAttemptTests(_NtfsFixture):
+    """Escape spellings that only mean something on Windows."""
+
+    ESCAPES = (
+        "..\\outside folder\\secret.txt",
+        "notes.txt\\..\\..\\outside folder\\secret.txt",
+        "..\\..\\outside folder/secret.txt",
+        "\\\\?\\" + "C:\\x\\secret.txt",
+        "\\\\.\\" + "C:\\x\\secret.txt",
+        "C:\\Windows\\win.ini",
+    )
+
+    def test_windows_escape_spellings_are_refused_or_inside(self):
+        for raw in self.ESCAPES:
+            with self.subTest(raw=raw):
+                self._assert_refused_or_inside(raw)
+
+    def test_environment_variables_are_expanded_then_checked(self):
+        os.environ["TPA_R11_OUTSIDE"] = str(self.outside)
+        self.addCleanup(os.environ.pop, "TPA_R11_OUTSIDE", None)
+        self._assert_refused_or_inside("%TPA_R11_OUTSIDE%\\secret.txt")
+        self._assert_refused_or_inside("%TPA_R11_OUTSIDE%/secret.txt")
+
+    def test_home_shorthand_is_expanded_then_checked(self):
+        self._assert_refused_or_inside("~\\secret.txt")
+        self._assert_refused_or_inside("~\\..\\outside folder\\secret.txt")
+
+    def test_trailing_dots_and_spaces_on_the_escape_are_refused_or_inside(self):
+        for raw in ("..\\outside folder\\secret.txt.", "..\\outside folder\\secret.txt "):
+            with self.subTest(raw=raw):
+                self._assert_refused_or_inside(raw)
+
+
+@ONLY_WINDOWS
+class WindowsProcessTests(unittest.TestCase):
+    """Real child processes. Harmless: a Python sleep and cmd echo only."""
+
+    def setUp(self) -> None:
+        action_base.clear_abort()
+        self.addCleanup(action_base.clear_abort)
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.heartbeat = self.dir / "heartbeat.txt"
+        (self.dir / "parent.py").write_text(PARENT_SRC, encoding="utf-8")
+        (self.dir / "grand.py").write_text(GRANDCHILD_SRC, encoding="utf-8")
+
+    def test_timeout_kills_a_grandchild_started_through_cmd(self):
+        argv = ["cmd", "/c", sys.executable, str(self.dir / "parent.py"),
+                str(self.heartbeat), str(self.dir / "grand.py")]
+        outcome: dict[str, object] = {}
+
+        def run() -> None:
+            try:
+                action_base.run_process(argv, timeout=3)
+            except ActionError as exc:
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        self.assertTrue(wait_for(lambda: self.heartbeat.exists() and self.heartbeat.stat().st_size > 0, 60))
+        worker.join(60)
+        self.assertFalse(worker.is_alive(), "cmd /c tree kept the pipe open after the timeout")
+        self.assertIn("timed out", str(outcome.get("error")))
+        assert_stopped(self, self.heartbeat)
+
+    def test_a_harmless_child_is_listed_and_killed_by_pid(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        ctx = ActionContext(config=make_config(Path(tmp.name)))
+        listed = system_mod.list_processes({"sort": "name", "limit": "100"}, ctx)
+        self.assertTrue(listed.ok)
+        result = system_mod.kill_process({"pid": str(child.pid)}, ctx)
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(child.wait(timeout=30))
+
+    def test_code_page_output_from_cmd_decodes_without_error(self):
+        proc = action_base.run_process(["cmd", "/c", "chcp 866 >nul && echo ok"], timeout=60)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("ok", proc.stdout)
+
+
+@ONLY_WINDOWS
+class WindowsLogFileTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        audit.close()
+        self.addCleanup(audit.close)
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.log = self.dir / "logs" / "a.log"
+
+    def test_a_log_file_locked_by_another_program_does_not_stop_startup(self):
+        self.log.parent.mkdir(parents=True)
+        self.log.write_text("locked", encoding="utf-8")
+        _handle, release = _hold_exclusive(self.log)
+        self.addCleanup(release)
+        import io
+        from contextlib import redirect_stderr
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            audit.setup(self.log, "INFO")
+            audit.warning("still running")
+        self.assertIn("console only", buffer.getvalue())
+
+    def test_rotation_works_on_a_real_file(self):
+        audit.setup(self.log, "CRITICAL")
+        for _ in range(25000):
+            audit.event("rotation", reason="rotation check")
+        audit.close()
+        self.assertTrue(self.log.with_name(self.log.name + ".1").exists())
+        self.assertLessEqual(self.log.stat().st_size, 2_000_000)
+
+
+if __name__ == "__main__":
+    unittest.main()

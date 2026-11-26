@@ -77,6 +77,9 @@ def clixml_to_text(raw: object) -> str:
     return text
 
 
+_TRACEBACK_LINE = re.compile(r'Traceback \(most recent call last\):|File "')
+
+
 def sanitize_failure(raw: object, limit: int = DEFAULT_REASON_LIMIT,
                      keep: Iterable[str] = ()) -> str:
     """A short, safe reason from PowerShell stderr.
@@ -99,7 +102,9 @@ def sanitize_failure(raw: object, limit: int = DEFAULT_REASON_LIMIT,
     lines: list[str] = []
     for line in text.splitlines():
         line = audit.redact_secret(line.strip())
-        if not line:
+        if not line or _TRACEBACK_LINE.match(line):
+            # Python traceback frames are not a reason a user can act on; keep only
+            # the exception line that follows them.
             continue
         line = _TOKEN_SHAPE.sub("[REDACTED]", line)
         line = _WINDOWS_PATH.sub("<path>", line)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -56,18 +57,27 @@ def setup(log_file: Path, level: str = "INFO") -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler = RotatingFileHandler(
-        log_file, maxBytes=2_000_000, backupCount=5, encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.DEBUG)
+    # A log file another program holds open (Windows sharing violation) must not
+    # stop the bot from starting. Fall back to console output and say so.
+    try:
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=2_000_000, backupCount=5, encoding="utf-8"
+        )
+    except OSError:
+        file_handler = None
 
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     console.setLevel(getattr(logging, level, logging.INFO))
 
     _LOGGER.setLevel(logging.DEBUG)
-    _LOGGER.addHandler(file_handler)
+    if file_handler is not None:
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.DEBUG)
+        _LOGGER.addHandler(file_handler)
+    else:
+        print("Warning: the log file is locked or unavailable (is another program "
+              "holding it open?). Logging to the console only.", file=sys.stderr)
     _LOGGER.addHandler(console)
     _LOGGER.propagate = False
     _configured = True

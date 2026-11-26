@@ -6,6 +6,7 @@ import base64
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -121,8 +122,8 @@ class ProcessRegistry:
         for proc in procs:
             try:
                 if proc.poll() is None:
-                    proc.kill()
                     killed += 1
+                kill_tree(proc)
             except Exception:
                 continue
         return killed
@@ -295,6 +296,19 @@ def resolve_in_roots(raw: str, config: Config, what: str = "Path", *, for_write:
     return resolved
 
 
+def os_error_reason(exc: OSError) -> str:
+    """A short, user-readable reason for a file error (no path, no raw errno text).
+
+    A file held open by another program (Windows sharing violation) is reported
+    as PermissionError, so the usual cause is named here.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return "the file was not found"
+    if isinstance(exc, PermissionError):
+        return "access was denied (it may be open in another program or read-only)"
+    return "the file could not be accessed"
+
+
 def sanitize_filename(name: str, fallback: str = "download.bin") -> str:
     """Strip directory parts and characters Windows cannot store."""
     raw = (name or "").replace("\\", "/").split("/")[-1].strip()
@@ -321,6 +335,59 @@ def unique_destination(folder: Path, filename: str) -> Path:
     raise ActionError(f"Could not find a free filename in {folder}")
 
 
+TREE_KILL_SECONDS = 15      # limit for the taskkill helper
+DRAIN_AFTER_KILL_SECONDS = 5  # limit for reading the pipes after a kill
+
+
+def _taskkill_exe() -> str:
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", "taskkill.exe")
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill ``proc`` and every process it started. Best effort; never raises.
+
+    A grandchild (for example python started through ``cmd /c``) can keep the
+    stdout pipe open after its parent dies. Killing only the direct child then
+    leaves the pipe open, so the caller would wait forever. On Windows
+    ``taskkill /T`` walks the process tree. On POSIX the child was started in its
+    own session (``start_new_session``), so the whole process group is killed.
+    """
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            if IS_WINDOWS:
+                subprocess.run(
+                    [_taskkill_exe(), "/T", "/F", "/PID", str(pid)],
+                    stdin=subprocess.DEVNULL, capture_output=True,
+                    timeout=TREE_KILL_SECONDS,
+                )
+            else:
+                os.killpg(pid, signal.SIGKILL)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _drain_after_kill(proc: subprocess.Popen) -> None:
+    """Read what is left in the pipes, but never wait without a limit."""
+    try:
+        proc.communicate(timeout=DRAIN_AFTER_KILL_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A stray grandchild still holds a pipe. Close ours and move on.
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def run_process(
     argv: list[str],
     timeout: float,
@@ -340,6 +407,8 @@ def run_process(
         "cwd": str(cwd) if cwd and Path(cwd).is_dir() else None,
         "env": env,
     }
+    if not IS_WINDOWS:
+        kwargs["start_new_session"] = True  # own process group, so kill_tree can reach it
     try:
         proc = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
     except OSError as exc:
@@ -350,8 +419,8 @@ def run_process(
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
+            kill_tree(proc)
+            _drain_after_kill(proc)
             raise ActionError(
                 f"Command timed out after {timeout:.0f}s and was killed."
             ) from None

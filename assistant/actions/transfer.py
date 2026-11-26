@@ -14,6 +14,7 @@ from .base import (
     ActionContext,
     ActionError,
     ActionResult,
+    os_error_reason,
     effective_roots,
     ensure_inside,
     ensure_not_protected,
@@ -43,12 +44,14 @@ def send_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
         raise ActionError("No file path given.")
 
     path = resolve_in_roots(raw, config, "File path")
-    if not path.exists():
-        raise ActionError(f"File not found: {path}")
-    if not path.is_file():
-        raise ActionError(f"That is not a file: {path}")
-
-    size = path.stat().st_size
+    try:
+        if not path.exists():
+            raise ActionError(f"File not found: {path}")
+        if not path.is_file():
+            raise ActionError(f"That is not a file: {path}")
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ActionError(f"Could not read the file: {os_error_reason(exc)}.") from None
     limit_bytes = config.max_send_file_mb * 1024 * 1024
     if size > limit_bytes:
         raise ActionError(

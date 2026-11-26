@@ -18,6 +18,7 @@ from .base import (
     URI_SCHEME_RE,
     WINDOWS_DRIVE_RE,
     check_path_syntax,
+    os_error_reason,
     ensure_not_protected,
     ps_literal,
     IS_WINDOWS,
@@ -238,20 +239,22 @@ def read_file(params: dict[str, str], ctx: ActionContext) -> ActionResult:
             "Set [paths] allowed_roots in config.ini."
         )
     target = resolve_path(params.get("path", ""), config, "File path")
-    if not target.exists():
-        raise ActionError(f"File not found: {target}")
-    if target.is_dir():
-        raise ActionError(f"That is a folder, not a file: {target}")
-
     limit_bytes = config.max_file_read_kb * 1024
-    size = target.stat().st_size
-    if size > limit_bytes:
-        raise ActionError(
-            f"File is {size / 1024:.0f} KB which is larger than max_file_read_kb "
-            f"({config.max_file_read_kb} KB). Raise the limit in config.ini if needed."
-        )
-
-    text = read_text_file(target)
+    try:
+        if not target.exists():
+            raise ActionError(f"File not found: {target}")
+        if target.is_dir():
+            raise ActionError(f"That is a folder, not a file: {target}")
+        size = target.stat().st_size
+        if size > limit_bytes:
+            raise ActionError(
+                f"File is {size / 1024:.0f} KB which is larger than max_file_read_kb "
+                f"({config.max_file_read_kb} KB). Raise the limit in config.ini if needed."
+            )
+        text = read_text_file(target)
+    except OSError as exc:
+        # Locked or unreadable files: a short reason, not a raw traceback line.
+        raise ActionError(f"Could not read the file: {os_error_reason(exc)}.") from None
     return ActionResult(
         "read_file",
         True,
