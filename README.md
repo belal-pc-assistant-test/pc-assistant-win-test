@@ -14,12 +14,37 @@ Control your Windows PC from Telegram. You send a request, the assistant shows a
 
 **تحقّق من رقمك في تيليغرام.** الإعداد الافتراضي `allowed_user_ids` هو `7823157087` (في `config.example.ini`). إذا لم يكن هذا رقمك الرقمي في تيليغرام، عدّل `allowed_user_ids` في `config.ini`. البوت يتجاهل بصمت كل حساب آخر. اعرف رقمك عبر @userinfobot.
 
-إذا لم يرد البوت، راجع قسم [Troubleshooting](#troubleshooting).
+إذا لم يرد البوت، راجع قسم [Troubleshooting](#troubleshooting) أو الدليل الكامل بالعربية والإنجليزية في [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 **أوامر جديدة:**
 * `/health` يفحص حالة الجهاز (المساحة الحرة، الذاكرة، مدة التشغيل، طلب إعادة التشغيل، Windows Defender، جدار الحماية، خدمة التحديث). لا يغيّر شيئًا ولا يحتاج موافقة.
 * `/install اسم` و`/uninstall اسم` يثبتان تطبيقًا أو يزيلانه عبر winget، ولا يعملان إلا للتطبيقات الموجودة في القائمة المسموحة. كل أمر يحتاج موافقتك أولًا، ويُعلَّم بأنه عالي الخطورة. سيظهر مربع **UAC** على شاشة الجهاز ويجب قبوله هناك، والبوت لا يتجاوزه.
 * راجع قسم [Health check and app install](#health-check-and-app-install) للتفاصيل.
+
+**كل الأوامر** (الشرح بالإنجليزية في قسم [Commands](#commands)):
+
+* `/start` و`/help`: مقدمة وقائمة الأوامر.
+* `/id` أو `/whoami`: يعرض رقم حسابك في تيليغرام.
+* `/status`: حالة البوت والمخطط والموافِقين والمهام.
+* `/privacy`: ما الذي يغادر الجهاز.
+* `/cancel`: يلغي الخطط المعلّقة.
+* `/panic`: يوقف كل شيء: يلغي الخطط، ويوقف مشاركة الشاشة والجلسات البعيدة والنفق.
+* `/pause`: يوقف كل عمل جديد حتى `/resume`، ويبقى محفوظًا بعد إعادة التشغيل. `/status` و`/resume` و`/panic` تبقى تعمل.
+* `/resume`: يتابع العمل بعد `/pause`.
+* `/yes CODE` و`/no CODE`: الموافقة على خطة أو رفضها (`/approve` و`/deny` تعملان أيضًا).
+* `/screen` و`/window [العنوان]`: لقطة شاشة واحدة، وتحتاج موافقة.
+* `/watch start` و`/watch speed N` و`/watch stop`: مشاركة الشاشة بشكل مرئي.
+* `/remote start [دقائق]` و`/remote status` و`/remote stop`: جلسة سطح مكتب عن بُعد.
+* `/health`: فحص للجهاز للقراءة فقط، ولا يحتاج موافقة.
+* `/install اسم` و`/uninstall اسم`: تثبيت تطبيق أو إزالته عبر winget، وتحتاج موافقة وقبول مربع UAC على الجهاز.
+* `/note نص` و`/notes` و`/forget N`: حفظ الملاحظات وعرضها وحذفها.
+* `/language ar` أو `/language en`: لغة الرسائل الاحتياطية.
+* `/briefing now` أو `/briefing daily HH:MM`: ملخص للحالة الآن، أو كل يوم في الوقت المحدد.
+* `/chain خطوة ; خطوة`: عدة خطوات في خطة واحدة مفصولة بـ `;`.
+* `/macro save NAME` و`/macro run NAME` و`/macro delete NAME` و`/macros`: حفظ قوائم الخطوات وإعادة استخدامها.
+* `/jobs` و`/canceltask CODE` و`/logs`: عرض المهام المجدولة، وإلغاء مهمة، وعرض بيانات السجل.
+
+ملاحظة: التطبيقات التي تُباع في متجر Microsoft فقط غير مدعومة في `/install`.
 
 ---
 
@@ -159,6 +184,7 @@ The second line downloads the model (not tested in this build). The model folder
 | Setting | Meaning |
 |---|---|
 | `[telegram] allowed_user_ids` | Telegram IDs allowed to use the bot, comma-separated |
+| `[telegram] bot_token` | Ignored. A value written here is never used. Put the token in `token.txt`, the `TELEGRAM_BOT_TOKEN` variable, or save it with `set_token.bat` |
 | `[telegram] approver_user_ids`, `require_distinct_approver` | Who may approve plans (must also be allowed); optionally, not the requester |
 | `[planner] mode` | `cloud` (default), `local` (Ollama) or `keywords` (offline rules) |
 | `[planner] cloud_cooldown_seconds` | Pause after a cloud rate-limit reply (default 120) |
@@ -223,6 +249,8 @@ The second line downloads the model (not tested in this build). The model folder
 * **winget and `/health` are not verified live on Windows yet.** The tests use stubs on Linux. `tests/test_windows_real.py` runs `winget --version` and a read-only health probe on a Windows runner, and skips winget when it is missing.
 
 ## Troubleshooting
+
+Short step-by-step fixes in English and Arabic are in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ### The bot does not answer
 

@@ -8,7 +8,7 @@ EXCLUDED_NAMES = {"token.txt", "token.json", "config.ini", ".env"}
 TOP_LEVEL = (
     "README.md", "requirements.txt", "requirements-voice.txt", "config.example.ini", "install.bat",
     "start_assistant.bat", "set_token.bat",
-    "check_setup.bat", "main.py", "build_zip.py", ".gitignore",
+    "check_setup.bat", "main.py", "build_zip.py", ".gitignore", "CHANGELOG.md",
 )
 
 
@@ -18,6 +18,8 @@ def build_zip(root: Path, output: Path) -> None:
     sources += sorted((root / "assistant").rglob("*.py"))
     # Shipped data files (the /install allow-list). Never user data or config.
     sources += sorted((root / "assistant" / "data").glob("*.json"))
+    # User-facing docs (troubleshooting in English and Arabic). Markdown only.
+    sources += sorted((root / "docs").glob("*.md"))
     sources += sorted((root / "tests").glob("test_*.py"))
     sources += sorted((root / "tests").glob("_*.py"))  # shared test helpers (no secrets)
     # CI workflow for the Windows-only tests (no secrets; it runs on a GitHub Windows runner).

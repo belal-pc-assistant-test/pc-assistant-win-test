@@ -21,6 +21,7 @@ import json
 import locale
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -29,6 +30,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
+from datetime import datetime
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -44,7 +48,7 @@ from assistant.actions import core as core_mod  # noqa: E402
 from assistant.actions import system as system_mod  # noqa: E402
 from assistant.actions import transfer as transfer_mod  # noqa: E402
 from assistant.actions.base import ActionContext  # noqa: E402
-from test_flow import make_config  # noqa: E402
+from test_flow import OTHER_ID, OWNER_ID, make_config  # noqa: E402
 from _hermetic import release_log_then_remove  # noqa: E402
 from assistant import bot as botmod  # noqa: E402
 from test_round11_quality import (GRANDCHILD_SRC, PARENT_SRC, assert_stopped,  # noqa: E402
@@ -52,6 +56,9 @@ from test_round11_quality import (GRANDCHILD_SRC, PARENT_SRC, assert_stopped,  #
 from assistant.remote.gate import AccessGate, generate_secret  # noqa: E402
 from assistant.remote.server import COOKIE_NAME, RemoteServer  # noqa: E402
 from assistant.remote.stream import FrameBroker  # noqa: E402
+from _mock_http import QuietHandler  # noqa: E402
+from telegram import Chat, Message, MessageEntity, Update, User  # noqa: E402
+from telegram.ext import Application as RealApplication  # noqa: E402
 
 ONLY_WINDOWS = unittest.skipUnless(os.name == "nt", "needs real Windows")
 
@@ -837,6 +844,221 @@ class WindowsLogFileTests(unittest.TestCase):
         audit.close()
         self.assertTrue(self.log.with_name(self.log.name + ".1").exists())
         self.assertLessEqual(self.log.stat().st_size, 2_000_000)
+
+
+# ---------------------------------------------------------------------------
+# Round 12: the whole bot against a threaded stub Telegram API, over real HTTP
+# ---------------------------------------------------------------------------
+
+class _StubTelegramApi:
+    """A threaded local stand-in for the Telegram Bot API.
+
+    It answers the methods the bot calls in these tests and records each call with its
+    parameters. It listens on 127.0.0.1 only. A client that disconnects early is ignored
+    (QuietHandler), so a dropped connection neither stops the stub nor prints a
+    traceback. Nothing here talks to the internet.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self._lock = threading.Lock()
+        self._message_id = 1000
+        stub = self
+
+        class Handler(QuietHandler):
+            def do_GET(self) -> None:
+                self._answer()
+
+            def do_POST(self) -> None:
+                self._answer()
+
+            def _answer(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                method = self.path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+                try:
+                    params = stub._parse(self.headers.get("Content-Type", ""), body)
+                    status, payload = 200, {"ok": True, "result": stub._result(method, params)}
+                except Exception as exc:  # the stub must answer, never crash the server
+                    status, payload = 500, {"ok": False, "error_code": 500, "description": repr(exc)}
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.write_safely(data)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        host, port = self._server.server_address[:2]
+        # PTB appends "<token>/<method>" to this base, so it must end in "/bot".
+        self.base_url = f"http://{host}:{port}/bot"
+
+    @staticmethod
+    def _parse(content_type: str, body: bytes) -> dict:
+        if content_type.startswith("application/json"):
+            return json.loads(body or b"{}")
+        if content_type.startswith("application/x-www-form-urlencoded"):
+            return {k: v[-1] for k, v in urllib.parse.parse_qs(body.decode("utf-8")).items()}
+        return {}  # multipart uploads: the method name is enough for these tests
+
+    def _result(self, method: str, params: dict):
+        with self._lock:
+            self.calls.append((method, params))
+            if method == "getMe":
+                return {"id": 777000, "is_bot": True, "first_name": "Stub", "username": "stub_bot"}
+            if method == "getUpdates":
+                return []
+            if method == "sendMessage":
+                self._message_id += 1
+                return {"message_id": self._message_id, "date": int(time.time()),
+                        "chat": {"id": int(params["chat_id"]), "type": "private"},
+                        "text": params.get("text", "")}
+        return True
+
+    def messages_to(self, chat_id: int) -> list[str]:
+        """Texts the bot sent to one chat, new messages and edits alike, in order."""
+        with self._lock:
+            calls = list(self.calls)
+        return [str(p.get("text", "")) for name, p in calls
+                if name in ("sendMessage", "editMessageText") and str(p.get("chat_id")) == str(chat_id)]
+
+    def methods_called(self) -> list[str]:
+        with self._lock:
+            return [name for name, _ in self.calls]
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+class _StubbedApplication:
+    """Stands in for telegram.ext.Application. build_application only calls .builder().
+
+    The builder is the real one, with only the API base URL pointed at the stub.
+    """
+
+    def __init__(self, base_url: str) -> None:
+        self._base_url = base_url
+
+    def builder(self):
+        return RealApplication.builder().base_url(self._base_url)
+
+
+def _plan_code(texts: list[str]) -> str:
+    for text in texts:
+        found = re.search(r"Code:\s*<code>([A-Za-z0-9]{4,12})</code>", text)
+        if found:
+            return found.group(1)
+    raise AssertionError(f"no plan code in the bot's replies: {texts!r}")
+
+
+@ONLY_WINDOWS
+class WindowsBotEndToEndTests(unittest.TestCase):
+    """The real bot object: PTB dispatch, real HTTP to a threaded stub Telegram API.
+
+    Commands go in as Telegram updates and replies come out as HTTP requests to the
+    stub. The commands are read-only or reversible: /start, /health, /pause, /resume,
+    and a read of one file in a temporary folder. Nothing touches the clipboard, the
+    screen, the keyboard or the mouse.
+    """
+
+    FILE_TEXT = "hello from the Windows end-to-end test"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="tpa-e2e-")
+        self.addCleanup(release_log_then_remove, self._tmp)
+        root = Path(self._tmp.name)
+        self.share = root / "share"
+        self.share.mkdir()
+        self.note = self.share / "hello.txt"
+        self.note.write_text(self.FILE_TEXT, encoding="utf-8")
+
+        self.config = make_config(root / "cfg")
+        self.config.bot_token = TOKEN
+        self.config.allowed_roots = [self.share]
+        audit.register_secret(TOKEN)
+        saved_secrets = set(audit._secrets)
+        self.addCleanup(lambda: (audit._secrets.clear(), audit._secrets.update(saved_secrets)))
+        audit.setup(self.config.log_file, self.config.log_level)
+
+        self.stub = _StubTelegramApi()
+        self.addCleanup(self.stub.close)
+        # Keep the loopback calls off any proxy the CI machine may set.
+        self.enterContext(mock.patch.dict(os.environ, {"NO_PROXY": "127.0.0.1,localhost",
+                                                       "no_proxy": "127.0.0.1,localhost"}))
+        self.enterContext(mock.patch.object(botmod, "Application",
+                                            _StubbedApplication(self.stub.base_url)))
+        self.next_update_id = 1
+
+    async def say(self, app, user_id: int, text: str) -> None:
+        update_id = self.next_update_id
+        self.next_update_id += 1
+        entities = None
+        if text.startswith("/"):
+            entities = [MessageEntity("bot_command", 0, len(text.split()[0]))]
+        message = Message(message_id=update_id, date=datetime.now(), chat=Chat(id=user_id, type="private"),
+                          from_user=User(id=user_id, first_name="tester", is_bot=False),
+                          text=text, entities=entities)
+        message.set_bot(app.bot)
+        await app.process_update(Update(update_id=update_id, message=message))
+
+    async def ask(self, app, user_id: int, text: str) -> list[str]:
+        """Send one update and return only the texts the bot sent to that chat in response."""
+        before = len(self.stub.messages_to(user_id))
+        await self.say(app, user_id, text)
+        return self.stub.messages_to(user_id)[before:]
+
+    def test_owner_gets_replies_and_strangers_get_none(self):
+        asyncio.run(self._drive())
+
+    async def _drive(self) -> None:
+        app = botmod.build_application(self.config)
+        await app.initialize()
+        try:
+            self.assertIn("getMe", self.stub.methods_called())  # the stub, not Telegram, answered
+
+            reply = await self.ask(app, OWNER_ID, "/start")
+            self.assertTrue(any("PC Assistant is online" in t for t in reply), reply)
+
+            health = await self.ask(app, OWNER_ID, "/health")
+            self.assertTrue(any("Disk" in t for t in health), health)
+
+            paused = await self.ask(app, OWNER_ID, "/pause")
+            self.assertTrue(any(t.startswith("⏸ Paused.") for t in paused), paused)
+
+            # A stranger gets nothing, whether or not the bot is paused.
+            self.assertEqual(await self.ask(app, OTHER_ID, "/start"), [])
+
+            # While paused the file request is refused with the notice, and nothing is planned.
+            gated = await self.ask(app, OWNER_ID, f"read {self.note}")
+            self.assertEqual(gated, [botmod.PAUSED_NOTICE])
+            self.assertNotIn(self.FILE_TEXT, " ".join(gated))
+            self.assertEqual(await self.ask(app, OTHER_ID, f"read {self.note}"), [])
+            self.assertEqual(app.bot_data["plans"], {})
+
+            resumed = await self.ask(app, OWNER_ID, "/resume")
+            self.assertTrue(any("Resumed" in t for t in resumed), resumed)
+
+            # The file request is planned first. Nothing is read until the owner approves.
+            planned = await self.ask(app, OWNER_ID, f"read {self.note}")
+            code = _plan_code(planned)
+            self.assertNotIn(self.FILE_TEXT, " ".join(planned))
+
+            result = await self.ask(app, OWNER_ID, f"approve {code}")
+            self.assertTrue(any(self.FILE_TEXT in t for t in result), result)
+
+            self.assertEqual(self.stub.messages_to(OTHER_ID), [])
+            everything = " ".join(self.stub.messages_to(OWNER_ID))
+            self.assertNotIn(TOKEN, everything)
+            self.assertNotIn(TOKEN.split(":", 1)[1], everything)
+        finally:
+            await app.shutdown()
+        log_file = self.config.log_file
+        if log_file.exists():
+            log_text = log_file.read_text(encoding="utf-8", errors="replace")
+            self.assertNotIn(TOKEN.split(":", 1)[1], log_text)
 
 
 if __name__ == "__main__":
