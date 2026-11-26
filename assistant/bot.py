@@ -32,7 +32,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -107,7 +107,7 @@ MSG = {
         "📖 <b>Commands</b>\n"
         "/start – intro\n"
         "/help – this text\n"
-        "/id – show your Telegram user id\n"
+        "/id (or /whoami) – show your Telegram user id\n"
         "/status – planner, approvers, jobs, config\n"
         "/privacy – where your request text goes\n"
         "/jobs – list reminders and scheduled tasks\n"
@@ -374,13 +374,29 @@ def build_keyboard(plan_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def utf16_len(text: str) -> int:
+    """Telegram counts message length in UTF-16 units, not Python characters."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _utf16_prefix(text: str, limit: int) -> str:
+    """The longest prefix of ``text`` whose UTF-16 length is at most ``limit``."""
+    units = 0
+    for index, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units > limit:
+            return text[:index]
+    return text
+
+
 def split_message(text: str, limit: int = MAX_TG_LEN) -> list[str]:
     chunks: list[str] = []
     remaining = text or ""
-    while len(remaining) > limit:
-        cut = remaining.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = limit
+    while utf16_len(remaining) > limit:
+        window = _utf16_prefix(remaining, limit) or remaining[:1]
+        cut = window.rfind("\n")
+        if cut < len(window) // 2:
+            cut = len(window)
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n")
     if remaining:
@@ -389,18 +405,31 @@ def split_message(text: str, limit: int = MAX_TG_LEN) -> list[str]:
 
 
 async def send_long(bot: Any, chat_id: int, text: str, **kwargs: Any) -> None:
-    """Send text in Telegram-sized chunks, degrading to plain text on errors."""
-    for chunk in split_message(text or "(empty)"):
-        try:
-            await bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
-        except TelegramError as exc:
-            audit.warning("Formatted send failed, retrying as plain text", error=str(exc))
-            plain = {k: v for k, v in kwargs.items() if k != "parse_mode"}
-            try:
-                await bot.send_message(chat_id=chat_id, text=chunk, **plain)
-            except TelegramError as exc2:
-                audit.warning("Failed to send message", error=str(exc2))
-                return
+    """Send text in Telegram-sized chunks, degrading to plain text on formatting errors.
+
+    Secrets are removed before splitting, so no chunk can carry part of one. Rate limits and
+    dropped connections are retried once by the outbound layer (``assistant/outbound.py``).
+    """
+    cleaned = audit.redact_secret(text or "(empty)")
+    for chunk in split_message(cleaned):
+        await _send_chunk(bot, chat_id, chunk, **kwargs)
+
+
+async def _send_chunk(bot: Any, chat_id: int, chunk: str, **kwargs: Any) -> None:
+    try:
+        await bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
+        return
+    except RetryAfter:
+        # Already retried once by the outbound layer. Plain text would hit the same limit.
+        audit.warning("Message not sent", reason="rate limit")
+        return
+    except TelegramError as exc:
+        audit.warning("Formatted send failed, retrying as plain text", error=str(exc))
+    plain = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+    try:
+        await bot.send_message(chat_id=chat_id, text=chunk, **plain)
+    except TelegramError as exc2:
+        audit.warning("Failed to send message", error=str(exc2))
 
 
 # ---------------------------------------------------------------------------
@@ -875,10 +904,25 @@ def external_destinations(config: Config) -> str:
     return ", ".join(destinations)
 
 
+TOKEN_SHAPE_RE = re.compile(r"\d{5,}:[A-Za-z0-9_\-]{20,}")
+TOKEN_REFUSAL = ("⚠️ That looks like a Telegram bot token. I did not read it or send it anywhere. "
+                 "Revoke it in @BotFather, then save the new token on the PC with set_token.bat "
+                 "or main.py --set-token.")
+
+
+def looks_like_token(text: str | None) -> bool:
+    """A token-shaped string must never reach a planner (the cloud planner is a third party)."""
+    return bool(TOKEN_SHAPE_RE.search(text or ""))
+
+
 async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, request: str,
                          *, from_voice: bool = False) -> None:
     message = update.effective_message
     user = update.effective_user
+    if looks_like_token(request):
+        audit.warning("Token-shaped text refused before planning", user_id=user.id)
+        await message.reply_text(TOKEN_REFUSAL)
+        return
     if len(request or "") > MAX_REQUEST_CHARS:
         # Refused before any planner (local or cloud) sees the text.
         await message.reply_text(
@@ -1777,6 +1821,9 @@ async def _app_request(update, context, action: str) -> None:
         await update.effective_message.reply_text(
             f"Usage: /{verb} NAME. Allowed names: {app_allowlist.names_text(apps)}"
         )
+        return
+    if looks_like_token(args[0]):
+        await update.effective_message.reply_text(TOKEN_REFUSAL)
         return
     name = args[0].lower()
     entry = apps.get(name)

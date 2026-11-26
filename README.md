@@ -12,7 +12,9 @@ Control your Windows PC from Telegram. You send a request, the assistant shows a
 4. انقر نقرًا مزدوجًا على **`start_assistant.bat`** وأبقِ النافذة مفتوحة.
 5. افتح البوت في تيليغرام، واضغط **Start**، ثم أرسل **`/start`**.
 
-إذا لم يرد البوت، راجع قسم [Troubleshooting](#troubleshooting). الإعداد الافتراضي يسمح بالرقم `7823157087` فقط.
+**تحقّق من رقمك في تيليغرام.** الإعداد الافتراضي `allowed_user_ids` هو `7823157087` (في `config.example.ini`). إذا لم يكن هذا رقمك الرقمي في تيليغرام، عدّل `allowed_user_ids` في `config.ini`. البوت يتجاهل بصمت كل حساب آخر. اعرف رقمك عبر @userinfobot.
+
+إذا لم يرد البوت، راجع قسم [Troubleshooting](#troubleshooting).
 
 **أوامر جديدة:**
 * `/health` يفحص حالة الجهاز (المساحة الحرة، الذاكرة، مدة التشغيل، طلب إعادة التشغيل، Windows Defender، جدار الحماية، خدمة التحديث). لا يغيّر شيئًا ولا يحتاج موافقة.
@@ -166,6 +168,14 @@ The second line downloads the model (not tested in this build). The model folder
 | `[voice] model_path` | Local Whisper model folder |
 | `[remote] default_minutes`, `max_minutes`, `tunnel_order`, `tools_dir`, `cloudflared_sha256` | Remote defaults (15 and 60), tunnel order, download folder, optional SHA-256 pin |
 | `[apps] extra_allowed_apps` | Extra apps for `/install` and `/uninstall`, as `name=winget.id` pairs. Empty by default. Add only IDs you trust |
+| `[planner] cloud_url`, `cloud_model`, `cloud_timeout`, `cloud_response_format` | Cloud planner address, model, timeout in seconds (default 45), and strict JSON mode (default on; retried without it if the service refuses it) |
+| `[ollama] use_ollama`, `model`, `timeout` | Whether the local Ollama planner is allowed at all (default on), its model (default `qwen2.5:3b`) and its timeout in seconds (default 90) |
+| `[behaviour] max_output_chars`, `max_file_read_kb` | Longest command output sent back in one message (default 3500 characters) and largest file `read_file` will read (default 200 KB) |
+| `[behaviour] protected_processes`, `blocked_patterns` | Extra process names `kill_process` must refuse, and extra text patterns the PowerShell action must refuse. Both are comma or semicolon separated and empty by default |
+| `[behaviour] screenshot_as_document` | `true` sends screenshots as files at full quality; `false` sends compressed photos (default `true`) |
+| `[behaviour] log_level` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` (default `INFO`). Any other value stops start-up |
+| `[paths] workspace_root` | Folder for relative paths, and the folder file actions use when no other allowed folder is set (default `.`, the project folder) |
+| `[paths] downloads_dir`, `jobs_file`, `log_file` | Where uploaded files go (`downloads`), the scheduled jobs file (`data/jobs.json`). `memory.json` and `pause.json` sit in the same folder, and the audit log (`logs/assistant.log`) |
 
 ## Privacy
 
@@ -263,7 +273,11 @@ The bot then pauses cloud planning for `cloud_cooldown_seconds` (default 120, N 
 
 ## Uninstall
 
-Delete `token.txt` yourself. Run `main.py --forget-token` to remove the stored token, delete `%APPDATA%\TelegramPCAssistant` if you want, delete the project folder, and revoke the bot in @BotFather.
+1. Close the `start_assistant.bat` window to stop the bot.
+2. Remove the saved token: run `.venv\Scripts\python.exe main.py --forget-token`. Then delete `token.txt` if you made one.
+3. Revoke the bot's token in @BotFather, so it stops working for anyone who copied it.
+4. Delete the project folder. It holds `.venv` (the Python packages), `config.ini`, `token.txt`, `logs\` (the audit log), `downloads\` (files the bot received) and `data\` (`jobs.json` for scheduled jobs, `memory.json` for notes, macros and preferences, and `pause.json` for the pause state). Also delete `%APPDATA%\TelegramPCAssistant` if it exists.
+5. The bot does not add itself to Windows startup, so there is no startup entry to remove. Apps installed with `/install` stay installed when you delete this folder. Remove them with `/uninstall NAME` (winget, approval needed) or in Windows Settings under Apps.
 
 ## For developers
 

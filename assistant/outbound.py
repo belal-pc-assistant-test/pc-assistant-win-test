@@ -16,9 +16,11 @@ The URL is not touched. It carries the token, but it is never shown in chat.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any
 
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError
 from telegram.request import HTTPXRequest, RequestData
 from telegram.request._requestparameter import RequestParameter
 
@@ -105,13 +107,57 @@ def prepare_request_data(request_data: RequestData | None) -> RequestData | None
     return RequestData(parameters=rebuilt)
 
 
+#: Text-only send methods that can be repeated once after a rate limit or a dropped
+#: connection. Uploads are not listed: their file stream may already have been read.
+RESENDABLE_METHODS = frozenset({"sendMessage", "editMessageText", "editMessageReplyMarkup",
+                                "answerCallbackQuery"})
+#: Longest wait Telegram's retry time may cause. A longer rate limit is not waited out.
+RATE_LIMIT_CAP_SECONDS = 30.0
+#: Pause before repeating a send whose connection dropped.
+NETWORK_RETRY_SECONDS = 2.0
+
+
+def _rate_limit_wait(payload: bytes) -> float:
+    """Telegram's ``retry_after`` from a 429 body, bounded to a sensible wait."""
+    try:
+        seconds = float(json.loads(payload)["parameters"]["retry_after"])
+    except (ValueError, TypeError, KeyError, AttributeError):
+        seconds = 1.0
+    return min(max(seconds, 1.0), RATE_LIMIT_CAP_SECONDS)
+
+
 class RedactingRequestMixin:
-    """Place in front of a request class: ``class Wrapped(RedactingRequestMixin, Base)``."""
+    """Place in front of a request class: ``class Wrapped(RedactingRequestMixin, Base)``.
+
+    Every call is redacted first. A text-only send that hits a rate limit (HTTP 429) is
+    repeated once after Telegram's retry time, and one that loses its connection is repeated
+    once after a short pause. Otherwise a single rate limit or network blip silently drops
+    the reply, because most replies are sent directly and not through a retrying helper.
+    A second failure is raised as before.
+    """
 
     async def do_request(self, url: str, method: str, request_data: RequestData | None = None,
                          **kwargs: Any) -> Any:
-        return await super().do_request(  # type: ignore[misc]
-            url, method, request_data=prepare_request_data(request_data), **kwargs)
+        prepared = prepare_request_data(request_data)
+        name = url.rsplit("/", 1)[-1]
+        if name not in RESENDABLE_METHODS:
+            return await super().do_request(  # type: ignore[misc]
+                url, method, request_data=prepared, **kwargs)
+        try:
+            status, payload = await super().do_request(  # type: ignore[misc]
+                url, method, request_data=prepared, **kwargs)
+        except NetworkError:
+            audit.warning("Telegram send retried once", reason="connection dropped")
+            await asyncio.sleep(NETWORK_RETRY_SECONDS)
+            return await super().do_request(  # type: ignore[misc]
+                url, method, request_data=prepared, **kwargs)
+        if status == 429:
+            wait = _rate_limit_wait(payload)
+            audit.warning("Telegram send retried once", reason="rate limit")
+            await asyncio.sleep(wait)
+            return await super().do_request(  # type: ignore[misc]
+                url, method, request_data=prepared, **kwargs)
+        return status, payload
 
 
 class RedactingHTTPXRequest(RedactingRequestMixin, HTTPXRequest):

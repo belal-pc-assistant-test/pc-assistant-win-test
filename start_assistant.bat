@@ -6,6 +6,7 @@ title Telegram PC Assistant
 
 if not exist ".venv\Scripts\python.exe" (
     echo [X] The virtual environment is missing. Run install.bat first.
+    echo بالعربية: بيئة التشغيل غير موجودة. شغّل install.bat أولًا.
     echo.
     pause
     exit /b 1
@@ -14,6 +15,7 @@ if not exist ".venv\Scripts\python.exe" (
 if not exist "config.ini" (
     echo [X] config.ini is missing.
     echo     Copy config.example.ini to config.ini ^(install.bat does this^).
+    echo بالعربية: ملف config.ini غير موجود. شغّل install.bat لإنشائه.
     echo.
     pause
     exit /b 1

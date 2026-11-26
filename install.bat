@@ -155,6 +155,10 @@ echo     3. On the FIRST screen, tick "Add python.exe to PATH" before you click 
 echo     4. Wait for the installation to finish.
 echo     5. Close this window and double-click install.bat again.
 echo.
+echo     بالعربية: ثبّت أحدث Python 3 من https://www.python.org/downloads/windows/
+echo     وفي الشاشة الأولى ضع علامة على Add python.exe to PATH قبل الضغط على Install.
+echo     ثم أغلق هذه النافذة وشغّل install.bat مرة أخرى.
+echo.
 goto ask_open_python
 
 :old_python
@@ -164,6 +168,9 @@ echo.
 echo     Install the newest Python 3 from https://www.python.org/downloads/windows/
 echo     and tick "Add python.exe to PATH". Then run install.bat again.
 echo     If the old version is still used, remove it in Windows Settings under Apps.
+echo.
+echo     بالعربية: تم العثور على Python قديم. المطلوب Python 3.11 أو أحدث.
+echo     ثبّت أحدث Python 3 من الموقع الرسمي، وضع علامة على Add python.exe to PATH، ثم شغّل install.bat مرة أخرى.
 echo.
 
 :ask_open_python
@@ -176,28 +183,33 @@ goto end_fail
 echo.
 echo [X] Could not create the virtual environment in the .venv folder.
 echo     Check that this folder is writable (not inside Program Files), then run install.bat again.
+echo     بالعربية: تعذّر إنشاء البيئة الافتراضية في .venv. تأكد أن المجلد قابل للكتابة وليس داخل Program Files، ثم شغّل install.bat مرة أخرى.
 goto end_fail
 
 :venv_broken
 echo.
 echo [X] The existing .venv folder cannot be used. It may come from an older Python or was moved.
 echo     Delete the .venv folder next to install.bat, then run install.bat again.
+echo     بالعربية: مجلد .venv الموجود لا يمكن استخدامه. احذف مجلد .venv بجانب install.bat ثم شغّل install.bat مرة أخرى.
 goto end_fail
 
 :pip_fail
 echo.
 echo [X] Installing the dependencies failed. Check your internet connection, then run install.bat again.
 echo     The error details are shown above.
+echo     بالعربية: فشل تثبيت المكتبات المطلوبة. تحقق من اتصال الإنترنت ثم شغّل install.bat مرة أخرى. التفاصيل ظاهرة أعلاه.
 goto end_fail
 
 :config_fail
 echo.
 echo [X] Could not create config.ini. Check that this folder is writable, then run install.bat again.
+echo بالعربية: تعذّر إنشاء ملف config.ini. تأكد أن المجلد قابل للكتابة ثم شغّل install.bat مرة أخرى.
 goto end_fail
 
 :end_fail
 echo.
 echo Setup did not finish. Nothing has been started.
+echo لم يكتمل الإعداد. لم يتم تشغيل أي شيء.
 echo.
 pause
 exit /b 1

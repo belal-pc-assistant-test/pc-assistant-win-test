@@ -284,6 +284,17 @@ def _resolve_token() -> tuple[str, str]:
     return "", ""
 
 
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _log_level(section) -> str:
+    """Refuse an unknown level instead of silently logging at INFO."""
+    level = _get_str(section, "log_level", "INFO").upper()
+    if level not in LOG_LEVELS:
+        raise ConfigError(f"[behaviour] log_level must be one of {', '.join(LOG_LEVELS)} — got {level!r}.")
+    return level
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Read and validate ``config.ini``.
 
@@ -423,7 +434,7 @@ def load_config(path: str | Path | None = None) -> Config:
         screenshot_as_document=_get_bool(behaviour, "screenshot_as_document", True),
         blocked_patterns=_split_list(behaviour.get("blocked_patterns")),
         log_file=log_file,
-        log_level=_get_str(behaviour, "log_level", "INFO").upper(),
+        log_level=_log_level(behaviour),
         keep_screenshots=_get_bool(paths, "keep_screenshots", True),
         screenshots_dir=screenshots_dir,
         downloads_dir=downloads_dir,
