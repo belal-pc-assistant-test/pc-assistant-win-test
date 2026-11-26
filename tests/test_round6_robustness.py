@@ -263,21 +263,25 @@ class StartupRetryTests(unittest.TestCase):
         self.assertEqual(sleeps, [])
 
     def test_real_library_with_unreachable_telegram_retries_then_raises(self):
+        # The real python-telegram-bot and httpx stack, with an in-memory transport that
+        # refuses every request. No socket is opened, so the result does not depend on
+        # how the OS answers a closed port (Linux refuses at once, Windows may time out).
+        import httpx
         from telegram.ext import ApplicationBuilder
+        from telegram.request import HTTPXRequest
+
+        def refuse(request):
+            raise httpx.ConnectError("connection refused (in-memory transport)", request=request)
 
         def make():
+            def request():
+                return HTTPXRequest(httpx_kwargs={"transport": httpx.MockTransport(refuse)})
             return (ApplicationBuilder().token(TOKEN)
-                    .base_url("http://127.0.0.1:9/bot").build())
+                    .request(request()).get_updates_request(request()).build())
 
         sleeps: list[float] = []
-        with mock.patch.dict(os.environ):
-            # A proxy in the environment must not change what this test checks:
-            # the refused connection to 127.0.0.1:9.
-            for key in [k for k in os.environ if "proxy" in k.lower()]:
-                del os.environ[key]
-            os.environ["NO_PROXY"] = "127.0.0.1,localhost"
-            with self.assertRaises(NetworkError):
-                main.run_polling_with_retries(make, attempts=2, sleep=sleeps.append)
+        with self.assertRaises(NetworkError):
+            main.run_polling_with_retries(make, attempts=2, sleep=sleeps.append)
         self.assertEqual(sleeps, [2])
 
 

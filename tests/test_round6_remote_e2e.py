@@ -68,9 +68,10 @@ class RemoteE2ETests(FakeOsTestCase):
         return headers["set-cookie"].split(f"{COOKIE_NAME}=")[1].split(";")[0]
 
     async def try_http(self, *args, **kwargs):
-        """After a stop the server may already be closed: a refused connection also counts as no access."""
+        """After a stop the server may already be closed: a refusal, a timeout or a reset all count
+        as no access. The bound keeps a Windows connect timeout (about 20 s) from stalling the test."""
         try:
-            return (await self.http(*args, **kwargs))[0]
+            return (await asyncio.wait_for(self.http(*args, **kwargs), 3))[0]
         except OSError:
             return None
 
@@ -189,11 +190,12 @@ class SessionEndTests(RemoteE2ETests):
         self.assertNotEqual(await self.try_http("GET", "/", headers={"Cookie": f"{COOKIE_NAME}={cookie}"}), 200)
         self.assertNotEqual(await self.try_http("GET", f"/connect/{self.secret}"), 303)
         try:
-            status, _, _, w2 = await ws_open(self.port, cookie, origin=f"https://{self.host}", host=self.host)
+            status, _, _, w2 = await asyncio.wait_for(
+                ws_open(self.port, cookie, origin=f"https://{self.host}", host=self.host), 3)
             await close_writer(w2)
             self.assertNotEqual(status, 101)
         except OSError:
-            pass  # listener already closed: the viewer cannot connect at all
+            pass  # listener already closed, or the connect timed out: the viewer cannot connect
 
     async def test_time_limit_stops_the_session(self):
         harness, session = await self.start(duration=0.3)

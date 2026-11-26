@@ -423,7 +423,8 @@ class GuardSelfTests(IsolatedCase):
         self.expect_refused(lambda: subprocess.run(["tpa-not-a-real-program"], check=False))
 
     def test_a_real_connection_is_refused(self):
-        self.expect_refused(lambda: socket.create_connection(("127.0.0.1", 9)))
+        # The guard refuses create_connection for every host before a socket exists, so no port is used.
+        self.expect_refused(lambda: socket.create_connection(("127.0.0.1", 0)))
 
     def test_isolated_case_undoes_secrets_and_the_powershell_reason_after_each_test(self):
         probe = IsolatedCase("setUp")  # an instance that runs only the reset machinery

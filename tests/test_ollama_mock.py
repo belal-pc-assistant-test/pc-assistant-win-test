@@ -15,7 +15,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 sys.path.insert(0, str(PROJECT_DIR / "tests"))
 
-from _mock_http import QuietHandler, start_server, stop_server  # noqa: E402
+from _mock_http import DEAD_URL, QuietHandler, refuse_connections_except, start_server, stop_server  # noqa: E402
 
 from assistant.planner import LocalPlanner, Planner                   # noqa: E402
 
@@ -67,6 +67,10 @@ class LocalPlannerTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         stop_server(cls.server)
 
+    def setUp(self) -> None:
+        # Only the mock server is reachable. Every other URL is refused in memory.
+        refuse_connections_except(self, self.url)
+
     def planner(self, model="qwen2.5:3b", url=None) -> LocalPlanner:
         return LocalPlanner(url or self.url, model, timeout=10)
 
@@ -108,11 +112,12 @@ class LocalPlannerTests(unittest.TestCase):
     def test_unreachable_ollama_raises(self):
         from assistant.planner import PlannerError
 
-        with self.assertRaises(PlannerError):
-            self.planner(url="http://127.0.0.1:9").plan("x", PROJECT_DIR, 6)
+        with self.assertRaises(PlannerError) as ctx:
+            self.planner(url=DEAD_URL).plan("x", PROJECT_DIR, 6)
+        self.assertIn("not running", str(ctx.exception))
 
     def test_facade_local_mode_falls_back_to_keywords(self):
-        planner = Planner(mode="local", local=self.planner(url="http://127.0.0.1:9"),
+        planner = Planner(mode="local", local=self.planner(url=DEAD_URL),
                           workspace_root=PROJECT_DIR)
         plan = planner.plan("خد لقطة شاشة")
         self.assertEqual(plan.planner, "keywords")

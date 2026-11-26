@@ -19,6 +19,12 @@ import socket
 import struct
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
+
+# A URL that must never be contacted. It has no DNS entry and no listener. Tests that use it
+# patch requests (refuse_connections_except), so no name lookup or socket happens. If a test
+# forgets the patch, the hermetic guard refuses the lookup instead.
+DEAD_URL = "http://no-server.invalid"
 
 
 class QuietHandler(BaseHTTPRequestHandler):
@@ -64,3 +70,37 @@ def start_server(handler_cls: type[BaseHTTPRequestHandler]) -> ThreadingHTTPServ
 def stop_server(server: ThreadingHTTPServer) -> None:
     server.shutdown()
     server.server_close()
+
+
+def refused_error(url: str = "") -> Exception:
+    """The error requests raises when nothing accepts the connection.
+
+    Built in memory, so it behaves the same on every OS. A real closed port is not used:
+    Linux refuses at once, but Windows can spend about 2 seconds on SYN retries first.
+    """
+    import requests
+    return requests.exceptions.ConnectionError(
+        ConnectionRefusedError(10061, f"connection refused {url}".strip()))
+
+
+def refuse_connections_except(testcase, allowed_prefix: str) -> None:
+    """Patch requests.get and requests.post for one test.
+
+    A URL that starts with allowed_prefix goes to the real function (the test's own mock
+    server). Any other URL raises refused_error() without opening a socket.
+    """
+    import requests
+
+    real = {"get": requests.get, "post": requests.post}
+
+    def router(name: str):
+        def route(url, *args, **kwargs):
+            if str(url).startswith(allowed_prefix):
+                return real[name](url, *args, **kwargs)
+            raise refused_error(str(url))
+        return route
+
+    for name in ("get", "post"):
+        patcher = mock.patch(f"requests.{name}", side_effect=router(name))
+        patcher.start()
+        testcase.addCleanup(patcher.stop)

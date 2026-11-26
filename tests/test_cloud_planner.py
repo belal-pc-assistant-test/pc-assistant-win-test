@@ -18,7 +18,14 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 sys.path.insert(0, str(PROJECT_DIR / "tests"))
 
-from _mock_http import QuietHandler, start_server, stop_server   # noqa: E402
+from _mock_http import (                                          # noqa: E402
+    DEAD_URL,
+    QuietHandler,
+    refuse_connections_except,
+    refused_error,
+    start_server,
+    stop_server,
+)
 from assistant.planner import (                                    # noqa: E402
     CloudPlanner,
     LocalPlanner,
@@ -216,15 +223,15 @@ class CloudPlannerTests(unittest.TestCase):
         self.assertIn("timed out", str(ctx.exception))
 
     def test_unreachable_endpoint(self):
-        with self.assertRaises(PlannerError) as ctx:
-            self.planner(url="http://127.0.0.1:9/openai", timeout=2).plan("x", self.tmp, 6)
-        message = str(ctx.exception)
-        # Linux reports a refused connect as "unreachable"; a slow Windows
-        # connect surfaces as "timed out". Either way the planner must fail
-        # safely (PlannerError -> the facade falls back to the next backend).
-        self.assertTrue(
-            "unreachable" in message or "timed out" in message, message
-        )
+        # Patched, not a real closed port: Windows can time out where Linux refuses.
+        # A real timeout is covered by test_timeout below.
+        with mock.patch("requests.post", side_effect=refused_error(DEAD_URL)) as post, \
+                mock.patch("assistant.planner.time.sleep") as sleep:
+            with self.assertRaises(PlannerError) as ctx:
+                self.planner(url=DEAD_URL + "/openai", timeout=2).plan("x", self.tmp, 6)
+        self.assertEqual(str(ctx.exception), "cloud planner unreachable (no internet?)")
+        self.assertEqual(post.call_count, 1)
+        sleep.assert_not_called()
 
     def test_non_json_reply(self):
         MockPollinations.behavior = "notjson"
@@ -277,9 +284,11 @@ class FallbackChainTests(unittest.TestCase):
         MockPollinations.behavior = "ok"
         MockPollinations.requests_seen = []
         MockPollinations.resets_left = 0
+        # Only the mock server is reachable. Every other URL is refused in memory.
+        refuse_connections_except(self, self.url)
 
     def dead_local(self) -> LocalPlanner:
-        return LocalPlanner("http://127.0.0.1:9", "qwen2.5:3b", timeout=1)
+        return LocalPlanner(DEAD_URL, "qwen2.5:3b", timeout=1)
 
     def test_cloud_is_used_first(self):
         planner = Planner(mode="cloud", cloud=CloudPlanner(url=self.url, timeout=5),
@@ -290,7 +299,7 @@ class FallbackChainTests(unittest.TestCase):
 
     def test_cloud_down_falls_back_to_keywords(self):
         planner = Planner(mode="cloud",
-                          cloud=CloudPlanner(url="http://127.0.0.1:9/openai", timeout=1),
+                          cloud=CloudPlanner(url=DEAD_URL + "/openai", timeout=1),
                           local=self.dead_local(), workspace_root=PROJECT_DIR)
         plan = planner.plan("take a screenshot")
         self.assertEqual(plan.planner, "keywords")
@@ -413,12 +422,16 @@ class ResetRetryTests(unittest.TestCase):
         self.assertEqual(plan.planner, "cloud")
 
     def test_a_refused_connection_is_not_retried(self):
-        cloud = CloudPlanner(url="http://127.0.0.1:9/openai", model="openai", timeout=2,
+        # The refusal is patched in memory: no socket, and no dependence on how the OS
+        # answers a closed port (Linux refuses at once; Windows may time out instead).
+        cloud = CloudPlanner(url=DEAD_URL + "/openai", model="openai", timeout=2,
                              reset_retry_seconds=0)
-        with mock.patch("assistant.planner.time.sleep") as sleep:
+        with mock.patch("requests.post", side_effect=refused_error(DEAD_URL)) as post, \
+                mock.patch("assistant.planner.time.sleep") as sleep:
             with self.assertRaises(PlannerError) as ctx:
                 cloud.plan("x", self.tmp, 6)
-        self.assertIn("unreachable", str(ctx.exception))
+        self.assertEqual(str(ctx.exception), "cloud planner unreachable (no internet?)")
+        self.assertEqual(post.call_count, 1, "a refused connection is tried exactly once")
         sleep.assert_not_called()
 
     def test_a_timeout_is_not_retried(self):
