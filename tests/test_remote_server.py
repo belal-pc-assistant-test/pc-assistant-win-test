@@ -7,7 +7,7 @@ import json
 import unittest
 
 from _bootstrap import PROJECT_DIR
-from _remote_helpers import client_frame, http_request, next_binary, next_json, ws_open
+from _remote_helpers import client_frame, close_writer, http_request, next_binary, next_json, ws_open
 from assistant.remote.gate import FAILURE_LIMIT, AccessGate, generate_secret
 from assistant.remote.server import COOKIE_NAME, RemoteServer
 from assistant.remote.stream import FrameBroker, JpegFrame
@@ -64,7 +64,7 @@ class ServerBindingTests(ServerHarness):
         writer.write(b"NOT HTTP AT ALL\r\n\r\n")
         await writer.drain()
         data = await asyncio.wait_for(reader.read(), 5)
-        writer.close()
+        await close_writer(writer)
         self.assertTrue(data.startswith(b"HTTP/1.1 400"))
 
 
@@ -103,7 +103,7 @@ class ViewerTests(ServerHarness):
         await writer.drain()
         pong = await next_json(reader, "pong")
         self.assertEqual(pong["id"], 7)
-        writer.close()
+        await close_writer(writer)
         for _ in range(100):
             if self.viewer_events[-1] is False:
                 break
@@ -116,15 +116,15 @@ class ViewerTests(ServerHarness):
         self.assertEqual(status, 101)
         second, _, _, writer2 = await ws_open(self.port, cookie, origin=f"https://{HOST}", host=HOST)
         self.assertEqual(second, 409)
-        writer2.close()
-        writer.close()
+        await close_writer(writer2)
+        await close_writer(writer)
 
     async def test_foreign_origin_is_refused(self):
         cookie = await self.redeem()
         status, _, _, writer = await ws_open(self.port, cookie, origin="https://evil.example", host=HOST)
         self.assertEqual(status, 403)
         self.assertIn("origin", self.denied)
-        writer.close()
+        await close_writer(writer)
 
     async def test_malformed_input_is_ignored_and_does_not_reach_control(self):
         cookie = await self.redeem()
@@ -135,7 +135,7 @@ class ViewerTests(ServerHarness):
         await writer.drain()
         await asyncio.sleep(0.05)
         self.assertEqual(self.inputs, [])
-        writer.close()
+        await close_writer(writer)
 
     async def test_server_close_disconnects_an_active_viewer(self):
         cookie = await self.redeem()
@@ -144,7 +144,7 @@ class ViewerTests(ServerHarness):
         await self.server.close()
         data = await asyncio.wait_for(reader.read(), 5)
         self.assertTrue(data == b"" or data.startswith(b"\x88"))
-        writer.close()
+        await close_writer(writer)
 
 
 class FailureLimitTests(ServerHarness):

@@ -913,8 +913,38 @@ def build_plan(
 # Backend 1: Pollinations (free, key-less, cloud)
 # ---------------------------------------------------------------------------
 
+def _is_reset_or_abort(exc: BaseException) -> bool:
+    """True when the connection was reset or aborted (not refused, not timed out).
+
+    requests wraps urllib3, which wraps the OS error. The OS error can sit in args,
+    __cause__, __context__ or .reason, so walk all of them. On Windows the same
+    events arrive as ConnectionAbortedError (WinError 10053) or ConnectionResetError
+    (10054); RemoteDisconnected is a ConnectionResetError subclass.
+    """
+    seen: set[int] = set()
+    stack: list[object] = [exc]
+    while stack:
+        item = stack.pop()
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return True
+        args = getattr(item, "args", ())
+        if isinstance(args, tuple):
+            stack.extend(args)
+        stack.append(getattr(item, "__cause__", None))
+        stack.append(getattr(item, "__context__", None))
+        stack.append(getattr(item, "reason", None))
+    return False
+
+
 class CloudPlanner:
     """OpenAI-compatible endpoint at text.pollinations.ai — no API key."""
+
+    # One retry after a reset or abort. The plan request is idempotent: it only
+    # asks for text and changes nothing on this PC.
+    RESET_RETRY_SECONDS = 1.0
 
     def __init__(
         self,
@@ -923,12 +953,16 @@ class CloudPlanner:
         timeout: float = 45.0,
         use_response_format: bool = True,
         cooldown_seconds: int = 120,
+        reset_retry_seconds: float | None = None,
     ) -> None:
         self.url = url
         self.model = model
         self.timeout = timeout
         self.use_response_format = use_response_format
         self.cooldown_seconds = max(10, int(cooldown_seconds))
+        self.reset_retry_seconds = (
+            self.RESET_RETRY_SECONDS if reset_retry_seconds is None else max(0.0, float(reset_retry_seconds))
+        )
         self._cooldown_until = 0.0
         self.last_error = ""
 
@@ -961,7 +995,7 @@ class CloudPlanner:
         content = self._extract_content(payload)
         return build_plan(content, "cloud", self.model, max_steps, workspace_root)
 
-    def _post(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, body: dict[str, Any], retry_reset: bool = True) -> dict[str, Any]:
         import requests
 
         try:
@@ -977,7 +1011,13 @@ class CloudPlanner:
             raise PlannerError(
                 f"cloud planner timed out after {self.timeout:.0f}s"
             ) from None
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.ConnectionError as exc:
+            if retry_reset and _is_reset_or_abort(exc):
+                # Once only, after a short pause. The retry call has retry_reset=False,
+                # so a second reset raises the usual "unreachable" error and the
+                # fallback chain takes over.
+                time.sleep(self.reset_retry_seconds)
+                return self._post(body, retry_reset=False)
             raise PlannerError("cloud planner unreachable (no internet?)") from None
         except Exception as exc:
             raise PlannerError(f"cloud planner request failed: {exc}") from None
@@ -997,7 +1037,7 @@ class CloudPlanner:
             # Some deployments do not support response_format — retry without it.
             retry_body = dict(body)
             retry_body.pop("response_format", None)
-            return self._post(retry_body)
+            return self._post(retry_body, retry_reset=retry_reset)
 
         if resp.status_code in (401, 403):
             raise PlannerError(f"cloud planner refused the request (HTTP {resp.status_code})")

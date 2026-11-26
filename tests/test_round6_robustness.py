@@ -42,7 +42,7 @@ from assistant.remote.gate import AccessGate, generate_secret  # noqa: E402
 from assistant.remote.server import RemoteServer  # noqa: E402
 from assistant.remote.session import RemoteController  # noqa: E402
 from assistant.remote.stream import FrameBroker  # noqa: E402
-from _remote_helpers import ws_open  # noqa: E402
+from _remote_helpers import close_writer, ws_open  # noqa: E402
 
 from test_flow import (  # noqa: E402
     FakeBot,
@@ -97,8 +97,8 @@ class ViewerRaceTests(unittest.IsolatedAsyncioTestCase):
                 ws_open(self.port, cookie, origin=f"https://{HOST}", host=HOST),
                 ws_open(self.port, cookie, origin=f"https://{HOST}", host=HOST),
             )
-        first[3].close()
-        second[3].close()
+        await close_writer(first[3])
+        await close_writer(second[3])
         self.assertEqual(sorted([first[0], second[0]]), [101, 409])
 
     async def _redeem(self):

@@ -7,11 +7,9 @@ object, or a real loopback HTTP server for the on-the-wire test.
 
 from __future__ import annotations
 
-import http.server
 import io
 import json
 import os
-import threading
 import unittest
 from unittest import mock
 from urllib.parse import unquote_plus
@@ -195,7 +193,9 @@ class OnTheWireTests(unittest.IsolatedAsyncioTestCase):
         self.received: list[tuple[str, bytes]] = []
         received = self.received
 
-        class Handler(http.server.BaseHTTPRequestHandler):
+        from _mock_http import QuietHandler, start_server, stop_server
+
+        class Handler(QuietHandler):
             def do_POST(self) -> None:  # noqa: N802 - http.server naming
                 length = int(self.headers.get("Content-Length", "0"))
                 received.append((self.path, self.rfile.read(length)))
@@ -204,15 +204,10 @@ class OnTheWireTests(unittest.IsolatedAsyncioTestCase):
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self.write_safely(body)
 
-            def log_message(self, *args) -> None:  # keep test output quiet
-                return None
-
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
+        self.server = start_server(Handler)
+        self.addCleanup(stop_server, self.server)
 
         # No proxy from the environment: the request must reach the loopback server.
         env = mock.patch.dict(os.environ)

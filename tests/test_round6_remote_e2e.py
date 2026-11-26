@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from _bootstrap import PROJECT_DIR
 assert PROJECT_DIR.is_dir()
 
-from _remote_helpers import client_frame, ws_open  # noqa: E402
+from _remote_helpers import client_frame, close_writer, ws_open  # noqa: E402
 from assistant.remote.server import COOKIE_NAME  # noqa: E402
 from test_remote_session import FakeOsTestCase, Harness, OWNER  # noqa: E402
 from assistant.remote.session import RemoteSession  # noqa: E402
@@ -107,17 +107,17 @@ class HostAndOriginTests(RemoteE2ETests):
         await self.start()
         cookie = await self.redeem()
         status, _, _, writer = await ws_open(self.port, cookie, origin="https://evil.example", host=self.host)
-        writer.close()
+        await close_writer(writer)
         self.assertEqual(status, 403)
         status, _, _, writer = await ws_open(self.port, cookie, origin=f"https://{self.host}", host=self.host)
-        writer.close()
+        await close_writer(writer)
         self.assertEqual(status, 101)
 
     async def test_null_origin_is_refused(self):
         await self.start()
         cookie = await self.redeem()
         status, _, _, writer = await ws_open(self.port, cookie, origin="null", host=self.host)
-        writer.close()
+        await close_writer(writer)
         self.assertEqual(status, 403)
 
 
@@ -143,7 +143,7 @@ class LinkAndCookieTests(RemoteE2ETests):
     async def test_websocket_needs_the_cookie(self):
         await self.start()
         status, _, _, writer = await ws_open(self.port, None, host=self.host)
-        writer.close()
+        await close_writer(writer)
         self.assertEqual(status, 403)
 
 
@@ -158,7 +158,7 @@ class ViewerLimitTests(RemoteE2ETests):
         )
         statuses = sorted([first[0], second[0]])
         for result in (first, second):
-            result[3].close()
+            await close_writer(result[3])
         self.assertEqual(statuses, [101, 409])
 
     async def test_a_new_viewer_can_connect_after_the_first_leaves(self):
@@ -166,11 +166,11 @@ class ViewerLimitTests(RemoteE2ETests):
         cookie = await self.redeem()
         status, _, _, writer = await ws_open(self.port, cookie, origin=f"https://{self.host}", host=self.host)
         self.assertEqual(status, 101)
-        writer.close()
+        await close_writer(writer)
         for _ in range(50):
             await asyncio.sleep(0.05)
             status, _, _, writer = await ws_open(self.port, cookie, origin=f"https://{self.host}", host=self.host)
-            writer.close()
+            await close_writer(writer)
             if status == 101:
                 break
         self.assertEqual(status, 101)
@@ -184,13 +184,13 @@ class SessionEndTests(RemoteE2ETests):
         status, _, _, writer = await ws_open(self.port, cookie, origin=f"https://{self.host}", host=self.host)
         self.assertEqual(status, 101)
         await session.stop("requested")
-        writer.close()
+        await close_writer(writer)
         self.assertEqual(session.state, "stopped")
         self.assertNotEqual(await self.try_http("GET", "/", headers={"Cookie": f"{COOKIE_NAME}={cookie}"}), 200)
         self.assertNotEqual(await self.try_http("GET", f"/connect/{self.secret}"), 303)
         try:
             status, _, _, w2 = await ws_open(self.port, cookie, origin=f"https://{self.host}", host=self.host)
-            w2.close()
+            await close_writer(w2)
             self.assertNotEqual(status, 101)
         except OSError:
             pass  # listener already closed: the viewer cannot connect at all
@@ -223,7 +223,7 @@ class SessionEndTests(RemoteE2ETests):
             await writer.drain()
         except OSError:
             pass  # the server already closed the socket, which is also a refusal
-        writer.close()
+        await close_writer(writer)
         await asyncio.sleep(0.1)
         self.assertEqual(harness.backend.calls, before, "no input may reach the PC after stop")
 

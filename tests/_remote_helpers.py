@@ -8,6 +8,19 @@ import os
 import struct
 
 
+async def close_writer(writer) -> None:
+    """Close a client stream and wait until it is really closed.
+
+    On Windows the proactor loop can report the peer's reset here; that is not a test
+    failure, so OSError (ConnectionError is a subclass) and a slow close are ignored.
+    """
+    try:
+        writer.close()
+        await asyncio.wait_for(writer.wait_closed(), 2)
+    except (OSError, asyncio.TimeoutError):
+        pass
+
+
 async def http_request(port: int, method: str, path: str, headers: dict[str, str] | None = None,
                        raw_body: bytes | None = None, host: str = "viewer.example"
                        ) -> tuple[int, dict[str, str], bytes]:
@@ -19,7 +32,7 @@ async def http_request(port: int, method: str, path: str, headers: dict[str, str
     writer.write(request + (raw_body or b""))
     await writer.drain()
     data = await asyncio.wait_for(reader.read(), 10)
-    writer.close()
+    await close_writer(writer)
     head, _, body = data.partition(b"\r\n\r\n")
     status_line, *header_lines = head.decode("latin-1").split("\r\n")
     status = int(status_line.split(" ")[1])

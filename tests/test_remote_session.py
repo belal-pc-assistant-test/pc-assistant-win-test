@@ -9,7 +9,7 @@ from unittest import mock
 
 from _bootstrap import PROJECT_DIR
 assert PROJECT_DIR.is_dir()
-from _remote_helpers import http_request, ws_open
+from _remote_helpers import close_writer, http_request, ws_open
 from assistant.remote import session as session_mod
 from assistant.remote.inputs import RecordingBackend
 from assistant.remote.session import RemoteController, RemoteDeps, RemoteSession
@@ -171,7 +171,7 @@ class RemoteSessionTests(FakeOsTestCase):
         self.assertEqual(again, 403)
         ok, _, _, writer = await ws_open(port, cookie, origin=host, host=host.split("//")[1])
         self.assertEqual(ok, 101)
-        writer.close()
+        await close_writer(writer)
 
     async def test_requests_without_cookie_or_secret_get_403(self):
         harness, session, _, _ = await self.start_session()

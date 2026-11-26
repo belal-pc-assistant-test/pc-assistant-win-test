@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
+sys.path.insert(0, str(PROJECT_DIR / "tests"))
+
+from _mock_http import QuietHandler, start_server, stop_server  # noqa: E402
 
 from assistant.planner import LocalPlanner, Planner                   # noqa: E402
 
@@ -27,13 +28,10 @@ CANNED_PLAN = {
 }
 
 
-class MockOllama(BaseHTTPRequestHandler):
+class MockOllama(QuietHandler):
     canned: dict = CANNED_PLAN
     models: list = ["qwen2.5:3b", "llama3.2:3b"]
     last_request: dict = {}
-
-    def log_message(self, *_args) -> None:   # silence the test output
-        return
 
     def do_GET(self) -> None:               # noqa: N802
         if self.path == "/api/tags":
@@ -55,22 +53,19 @@ class MockOllama(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self.write_safely(data)
 
 
 class LocalPlannerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = HTTPServer(("127.0.0.1", 0), MockOllama)
+        cls.server = start_server(MockOllama)
         cls.port = cls.server.server_address[1]
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
         cls.url = f"http://127.0.0.1:{cls.port}"
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.server.shutdown()
-        cls.server.server_close()
+        stop_server(cls.server)
 
     def planner(self, model="qwen2.5:3b", url=None) -> LocalPlanner:
         return LocalPlanner(url or self.url, model, timeout=10)

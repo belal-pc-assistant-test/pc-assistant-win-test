@@ -9,21 +9,23 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
+sys.path.insert(0, str(PROJECT_DIR / "tests"))
 
+from _mock_http import QuietHandler, start_server, stop_server   # noqa: E402
 from assistant.planner import (                                    # noqa: E402
     CloudPlanner,
     LocalPlanner,
     Planner,
     PlannerError,
     PlanValidationError,
+    _is_reset_or_abort,
 )
 
 GOOD_PLAN = {
@@ -33,12 +35,10 @@ GOOD_PLAN = {
 }
 
 
-class MockPollinations(BaseHTTPRequestHandler):
+class MockPollinations(QuietHandler):
     behavior = "ok"
     requests_seen: list[dict] = []
-
-    def log_message(self, *_args) -> None:
-        return
+    resets_left = 0          # for "reset_once": how many requests to reset before answering
 
     def do_POST(self) -> None:                                  # noqa: N802
         length = int(self.headers.get("Content-Length", 0))
@@ -47,6 +47,11 @@ class MockPollinations(BaseHTTPRequestHandler):
 
         mode = MockPollinations.behavior
 
+        if mode == "reset_always":
+            return self.reset_connection()
+        if mode == "reset_once" and MockPollinations.resets_left > 0:
+            MockPollinations.resets_left -= 1
+            return self.reset_connection()
         if mode == "reject_format" and "response_format" in body:
             return self._json({"error": {"message": "unknown field response_format"}}, 400)
         if mode == "429":
@@ -78,7 +83,7 @@ class MockPollinations(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload)
+            self.write_safely(payload)
             return
         return self._json(self._completion(json.dumps(GOOD_PLAN, ensure_ascii=False)))
 
@@ -94,28 +99,24 @@ class MockPollinations(BaseHTTPRequestHandler):
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        try:
-            self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # the client timed out on purpose
+        self.write_safely(payload)  # a client that timed out on purpose is not an error
 
 
 class CloudPlannerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = HTTPServer(("127.0.0.1", 0), MockPollinations)
+        cls.server = start_server(MockPollinations)
         cls.port = cls.server.server_address[1]
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.url = f"http://127.0.0.1:{cls.port}/openai"
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.server.shutdown()
-        cls.server.server_close()
+        stop_server(cls.server)
 
     def setUp(self) -> None:
         MockPollinations.behavior = "ok"
         MockPollinations.requests_seen = []
+        MockPollinations.resets_left = 0
         self.tmp = Path(PROJECT_DIR)  # any existing folder works as workspace
 
     def planner(self, url: str | None = None, timeout: float = 5.0) -> CloudPlanner:
@@ -162,10 +163,7 @@ class CloudPlannerTests(unittest.TestCase):
             handler.send_header("Content-Type", "application/json")
             handler.send_header("Content-Length", str(len(payload)))
             handler.end_headers()
-            try:
-                handler.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            handler.write_safely(payload)
 
         MockPollinations.do_POST = patched
         try:
@@ -268,18 +266,17 @@ class CloudPlannerTests(unittest.TestCase):
 class FallbackChainTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = HTTPServer(("127.0.0.1", 0), MockPollinations)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.server = start_server(MockPollinations)
         cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}/openai"
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.server.shutdown()
-        cls.server.server_close()
+        stop_server(cls.server)
 
     def setUp(self) -> None:
         MockPollinations.behavior = "ok"
         MockPollinations.requests_seen = []
+        MockPollinations.resets_left = 0
 
     def dead_local(self) -> LocalPlanner:
         return LocalPlanner("http://127.0.0.1:9", "qwen2.5:3b", timeout=1)
@@ -335,10 +332,7 @@ class FallbackChainTests(unittest.TestCase):
             handler.send_header("Content-Type", "application/json")
             handler.send_header("Content-Length", str(len(payload)))
             handler.end_headers()
-            try:
-                handler.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            handler.write_safely(payload)
 
         MockPollinations.do_POST = patched
         try:
@@ -357,6 +351,118 @@ class FallbackChainTests(unittest.TestCase):
         self.assertEqual(info["chain"], ["cloud", "local", "keywords"])
         self.assertIn("url", info["cloud"])
         self.assertFalse(info["local"]["reachable"])
+
+
+class ResetRetryTests(unittest.TestCase):
+    """A connection reset or abort is retried once, after a pause. Nothing else is."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = start_server(MockPollinations)
+        cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}/openai"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        stop_server(cls.server)
+
+    def setUp(self) -> None:
+        MockPollinations.behavior = "ok"
+        MockPollinations.requests_seen = []
+        MockPollinations.resets_left = 0
+        self.tmp = Path(PROJECT_DIR)
+
+    def planner_fast(self) -> CloudPlanner:
+        return CloudPlanner(url=self.url, model="openai", timeout=5, reset_retry_seconds=0)
+
+    def test_one_reset_then_success_returns_the_plan(self):
+        MockPollinations.behavior = "reset_once"
+        MockPollinations.resets_left = 1
+        plan = self.planner_fast().plan("take a screenshot", self.tmp, 6)
+        self.assertEqual(plan.planner, "cloud")
+        self.assertEqual(plan.steps[0].action, "screenshot")
+        self.assertEqual(len(MockPollinations.requests_seen), 2, "one failed attempt, one retry")
+
+    def test_the_retry_does_not_start_a_cooldown(self):
+        MockPollinations.behavior = "reset_once"
+        MockPollinations.resets_left = 1
+        cloud = self.planner_fast()
+        cloud.plan("take a screenshot", self.tmp, 6)
+        self.assertFalse(cloud.cooling_down()[0])
+
+    def test_two_resets_in_a_row_fall_back_with_the_usual_message(self):
+        MockPollinations.behavior = "reset_always"
+        with self.assertRaises(PlannerError) as ctx:
+            self.planner_fast().plan("x", self.tmp, 6)
+        self.assertIn("unreachable", str(ctx.exception))
+        self.assertEqual(len(MockPollinations.requests_seen), 2, "exactly one retry, never a loop")
+
+    def test_the_retry_waits_the_default_pause(self):
+        MockPollinations.behavior = "reset_once"
+        MockPollinations.resets_left = 1
+        cloud = CloudPlanner(url=self.url, model="openai", timeout=5)  # default pause
+        with mock.patch("assistant.planner.time.sleep") as sleep:
+            cloud.plan("x", self.tmp, 6)
+        sleep.assert_called_once_with(CloudPlanner.RESET_RETRY_SECONDS)
+
+    def test_the_server_keeps_serving_after_it_reset_a_connection(self):
+        MockPollinations.behavior = "reset_always"
+        with self.assertRaises(PlannerError):
+            self.planner_fast().plan("x", self.tmp, 6)
+        MockPollinations.behavior = "ok"
+        plan = self.planner_fast().plan("take a screenshot", self.tmp, 6)
+        self.assertEqual(plan.planner, "cloud")
+
+    def test_a_refused_connection_is_not_retried(self):
+        cloud = CloudPlanner(url="http://127.0.0.1:9/openai", model="openai", timeout=2,
+                             reset_retry_seconds=0)
+        with mock.patch("assistant.planner.time.sleep") as sleep:
+            with self.assertRaises(PlannerError) as ctx:
+                cloud.plan("x", self.tmp, 6)
+        self.assertIn("unreachable", str(ctx.exception))
+        sleep.assert_not_called()
+
+    def test_a_timeout_is_not_retried(self):
+        MockPollinations.behavior = "slow"
+        cloud = CloudPlanner(url=self.url, model="openai", timeout=0.1, reset_retry_seconds=0)
+        with self.assertRaises(PlannerError) as ctx:
+            cloud.plan("x", self.tmp, 6)
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertEqual(len(MockPollinations.requests_seen), 1)
+
+
+class ResetClassifierTests(unittest.TestCase):
+    """Which failures count as a reset or abort. No network involved."""
+
+    def _wrapped(self, inner: BaseException):
+        import requests
+        from urllib3.exceptions import ProtocolError
+        return requests.exceptions.ConnectionError(ProtocolError("Connection aborted.", inner))
+
+    def test_reset_and_abort_are_retryable(self):
+        self.assertTrue(_is_reset_or_abort(ConnectionResetError(10054, "reset")))
+        self.assertTrue(_is_reset_or_abort(ConnectionAbortedError(10053, "aborted")))
+        self.assertTrue(_is_reset_or_abort(BrokenPipeError()))
+
+    def test_requests_wrapped_resets_are_retryable(self):
+        self.assertTrue(_is_reset_or_abort(self._wrapped(ConnectionResetError("peer reset"))))
+        self.assertTrue(_is_reset_or_abort(self._wrapped(ConnectionAbortedError("aborted"))))
+
+    def test_remote_disconnect_is_retryable(self):
+        from http.client import RemoteDisconnected
+        self.assertTrue(_is_reset_or_abort(self._wrapped(RemoteDisconnected("closed"))))
+
+    def test_refused_timeout_and_other_errors_are_not_retryable(self):
+        self.assertFalse(_is_reset_or_abort(ConnectionRefusedError(10061, "refused")))
+        self.assertFalse(_is_reset_or_abort(self._wrapped(ConnectionRefusedError("refused"))))
+        self.assertFalse(_is_reset_or_abort(OSError("no route")))
+        self.assertFalse(_is_reset_or_abort(TimeoutError("slow")))
+
+    def test_the_walk_terminates_on_a_cycle(self):
+        a = RuntimeError("a")
+        b = RuntimeError("b")
+        a.__context__ = b
+        b.__context__ = a
+        self.assertFalse(_is_reset_or_abort(a))
 
 
 if __name__ == "__main__":
